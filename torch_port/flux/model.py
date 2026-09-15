@@ -22,8 +22,8 @@ _MAX_FUSED_DIM = 1024  # CUDA max threads per block
 
 # ── Debug logging control ─────────────────────────────────────────────
 _model_fwd_count = 0
-_VERBOSE_UNTIL = 12     # Full tensor stats for first N forward passes
-_LAYER_LOG_UNTIL = 20   # Layer entry/exit logging for first N passes
+_VERBOSE_UNTIL = 0      # Full tensor stats for first N forward passes
+_LAYER_LOG_UNTIL = 0    # Layer entry/exit logging for first N passes
 
 
 def reset_debug_counters():

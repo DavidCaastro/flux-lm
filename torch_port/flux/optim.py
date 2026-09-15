@@ -7,7 +7,7 @@ import torch.nn.functional as F
 from torch.optim import Optimizer
 
 _step_count = 0
-_LOG_STEPS_UNTIL = 3  # Log first N optimizer steps in detail
+_LOG_STEPS_UNTIL = 0  # Log first N optimizer steps in detail
 
 
 def _olog(msg):

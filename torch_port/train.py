@@ -465,8 +465,8 @@ def train_one_epoch(model, loader, optimizer, scaler, amp_ctx,
         t_step_start = time.time()
         heartbeat(f"epoch {epoch}, batch {step+1}/{total_batches}")
 
-        # Verbose for first 15, every 200th, and last batch
-        verbose = (step < 15) or (step % 200 == 0) or (step == total_batches - 1)
+        # Verbose only first 2, every 5000th, and last batch
+        verbose = (step < 2) or (step % 5000 == 0) or (step == total_batches - 1)
 
         bp = f"E{epoch} B{step+1}/{total_batches}"
 
@@ -551,18 +551,11 @@ def train_one_epoch(model, loader, optimizer, scaler, amp_ctx,
                 t_opt = time.time() - t0
                 tlog(f"    [{bp}] OPTIMIZER done={t_opt:.3f}s, VRAM={vram()}")
 
-                # NaN check on all parameters after optimizer step
-                tlog(f"    [{bp}] NaN check on weights...")
-                for pname, pp in raw.named_parameters():
-                    if pp.isnan().any().item():
-                        tlog(f"    [{bp}] *** NaN DETECTED in {pname} "
-                             f"shape={list(pp.shape)} "
-                             f"norm={pp.float().norm().item()} "
-                             f"nan_count={pp.isnan().sum().item()}/{pp.numel()}")
-                    elif pp.isinf().any().item():
-                        tlog(f"    [{bp}] *** Inf DETECTED in {pname} "
-                             f"shape={list(pp.shape)}")
-                tlog(f"    [{bp}] NaN check done")
+                # NaN check only on last batch of epoch
+                if step == total_batches - 1:
+                    has_nan = any(p.isnan().any().item() for p in raw.parameters())
+                    if has_nan:
+                        tlog(f"    [{bp}] *** NaN DETECTED in weights!")
 
         # Accumulate loss
         running_loss += loss.detach() * grad_accum
@@ -601,7 +594,7 @@ def eval_loss(model, loader, amp_ctx, device, epoch=0):
         total_loss += loss.item()
         n_batches += 1
 
-        if step < 3 or step % 200 == 0 or step == total - 1:
+        if step == 0 or step == total - 1:
             tlog(f"    eval {step+1}/{total}: loss={loss.item():.4f}")
 
     avg = total_loss / max(n_batches, 1)
