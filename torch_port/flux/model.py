@@ -34,7 +34,7 @@ def wht(x: torch.Tensor) -> torch.Tensor:
         x = torch.stack([a + b, a - b], dim=2).reshape(-1, d)
         half *= 2
 
-    return (x / math.sqrt(d)).reshape(*batch_shape, d)
+    return (x * (1.0 / math.sqrt(d))).reshape(*batch_shape, d)
 
 
 def parallel_scan(decay: torch.Tensor, x: torch.Tensor) -> torch.Tensor:

@@ -10,12 +10,10 @@ Usage:
 
   Resume from checkpoint:
     python train.py --corpus data.txt --ckpt flux_model.pt --resume
-
-  Load Rust checkpoint:
-    python train.py --corpus data.txt --rust-ckpt model.bin --d 256 --layers 3
 """
 
 import os
+import signal
 import sys
 import math
 import time
@@ -31,21 +29,25 @@ from torch.utils.data.distributed import DistributedSampler
 from flux.model import FluxModel
 from flux.optim import EntropicAdam, WarmRestartCosineSchedule
 from flux.data import ByteCorpusDataset, load_corpus
-from flux.checkpoint import (save_pytorch, load_pytorch,
-                              load_rust_checkpoint)
+from flux.checkpoint import save_pytorch, load_pytorch, load_rust_checkpoint
 
 LN2 = 0.6931471805599453
+
+# Global flag for graceful shutdown
+_shutdown_requested = False
+
+
+def _signal_handler(signum, frame):
+    global _shutdown_requested
+    _shutdown_requested = True
 
 
 def parse_args():
     p = argparse.ArgumentParser(description='Flux v3 Training')
-    # Model
     p.add_argument('--d', type=int, default=256)
     p.add_argument('--layers', type=int, default=3)
-    # Data
     p.add_argument('--corpus', type=str, required=True)
     p.add_argument('--seq-len', type=int, default=256)
-    # Training
     p.add_argument('--epochs', type=int, default=50)
     p.add_argument('--batch-size', type=int, default=64)
     p.add_argument('--lr', type=float, default=1e-3)
@@ -53,24 +55,16 @@ def parse_args():
     p.add_argument('--grad-accum', type=int, default=1)
     p.add_argument('--max-grad-norm', type=float, default=5.0)
     p.add_argument('--seed', type=int, default=42)
-    # GPU
     p.add_argument('--dtype', choices=['fp32', 'bf16', 'fp16'], default='bf16')
-    p.add_argument('--compile', action='store_true',
-                   help='torch.compile the model')
-    p.add_argument('--grad-checkpoint', action='store_true',
-                   help='Gradient checkpointing per layer')
-    p.add_argument('--parallel', action='store_true',
-                   help='Parallel scan (mean-field) instead of sequential loop')
-    p.add_argument('--n-corrections', type=int, default=1,
-                   help='Perturbative correction depth for parallel mode')
-    # Checkpointing
+    p.add_argument('--compile', action='store_true')
+    p.add_argument('--grad-checkpoint', action='store_true')
+    p.add_argument('--parallel', action='store_true')
+    p.add_argument('--n-corrections', type=int, default=1)
     p.add_argument('--ckpt', type=str, default=None)
     p.add_argument('--resume', action='store_true')
-    p.add_argument('--rust-ckpt', type=str, default=None,
-                   help='Load weights from Rust binary checkpoint')
+    p.add_argument('--rust-ckpt', type=str, default=None)
     p.add_argument('--ckpt-every', type=int, default=10)
     p.add_argument('--ckpt-dir', type=str, default='checkpoints')
-    # Logging
     p.add_argument('--wandb', action='store_true')
     p.add_argument('--wandb-project', type=str, default='flux-lm')
     p.add_argument('--print-every', type=int, default=5)
@@ -79,7 +73,6 @@ def parse_args():
 
 
 def setup_ddp():
-    """Returns (rank, local_rank, world_size, device). Sets up DDP if launched via torchrun."""
     ddp = int(os.environ.get('RANK', -1)) != -1
     if ddp:
         torch.distributed.init_process_group(backend='nccl')
@@ -102,7 +95,36 @@ def log(msg, rank=0):
         print(f'[{ts}] {msg}', flush=True)
 
 
+def preflight(model, device, batch_size, seq_len, dtype, rank):
+    """Quick forward+backward check before training starts."""
+    log('Preflight check ...', rank)
+    x = torch.randint(0, 256, (min(batch_size, 4), seq_len), device=device)
+    y = torch.randint(0, 256, (min(batch_size, 4), seq_len), device=device)
+    ptdtype = {'fp32': torch.float32, 'bf16': torch.bfloat16,
+               'fp16': torch.float16}[dtype]
+    use_amp = dtype != 'fp32' and device != 'cpu'
+    ctx = torch.autocast('cuda', dtype=ptdtype) if use_amp else nullcontext()
+    try:
+        with ctx:
+            _, loss = model(x, y)
+        loss.backward()
+        model.zero_grad(set_to_none=True)
+        torch.cuda.synchronize()
+        mem = torch.cuda.max_memory_allocated() / 1024**3
+        log(f'  OK: loss={loss.item():.4f}, peak_vram={mem:.1f}GB', rank)
+        torch.cuda.reset_peak_memory_stats()
+    except RuntimeError as e:
+        log(f'  FAILED: {e}', rank)
+        sys.exit(1)
+    del x, y
+    torch.cuda.empty_cache()
+
+
 def main():
+    global _shutdown_requested
+    signal.signal(signal.SIGTERM, _signal_handler)
+    signal.signal(signal.SIGINT, _signal_handler)
+
     args = parse_args()
     rank, local_rank, world_size, device, ddp = setup_ddp()
     is_master = rank == 0
@@ -125,42 +147,35 @@ def main():
     test_ds = ByteCorpusDataset(test_data, args.seq_len)
 
     train_sampler = DistributedSampler(train_ds, shuffle=True) if ddp else None
+    wk = args.num_workers
     train_loader = DataLoader(
-        train_ds,
-        batch_size=args.batch_size,
-        shuffle=(train_sampler is None),
-        sampler=train_sampler,
-        num_workers=args.num_workers,
-        pin_memory=True,
-        drop_last=True,
-        persistent_workers=args.num_workers > 0,
+        train_ds, batch_size=args.batch_size,
+        shuffle=(train_sampler is None), sampler=train_sampler,
+        num_workers=wk, pin_memory=True, drop_last=True,
+        persistent_workers=wk > 0,
     )
     test_loader = DataLoader(
-        test_ds,
-        batch_size=args.batch_size,
-        shuffle=False,
-        num_workers=min(args.num_workers, 2),
-        pin_memory=True,
-        drop_last=True,
+        test_ds, batch_size=args.batch_size, shuffle=False,
+        num_workers=min(wk, 2), pin_memory=True, drop_last=True,
+        persistent_workers=min(wk, 2) > 0,
     )
 
-    log(f'Corpus: {len(train_data) + len(test_data)} bytes '
+    log(f'Corpus: {len(train_data)+len(test_data)} bytes '
         f'(train={len(train_data)}, test={len(test_data)}), '
         f'seq_len={args.seq_len}', rank)
-    log(f'Train chunks: {len(train_ds)}, Test chunks: {len(test_ds)}', rank)
+    log(f'Train: {len(train_ds)} chunks, {len(train_ds)//args.batch_size} '
+        f'batches/epoch | Test: {len(test_ds)} chunks', rank)
 
     # ── Model ──
     start_epoch = 0
     if args.resume and args.ckpt and os.path.exists(args.ckpt):
         model, ckpt_info = load_pytorch(args.ckpt, device='cpu')
         start_epoch = ckpt_info['epoch']
-        log(f'Resumed from {args.ckpt} (epoch {start_epoch}, '
-            f'loss={ckpt_info["loss"]:.4f})', rank)
+        log(f'Resumed from {args.ckpt} (epoch {start_epoch})', rank)
     elif args.rust_ckpt:
         model, ckpt_info = load_rust_checkpoint(args.rust_ckpt)
         start_epoch = ckpt_info['epoch']
-        log(f'Loaded Rust checkpoint {args.rust_ckpt} '
-            f'(epoch {start_epoch}, loss={ckpt_info["loss"]:.4f})', rank)
+        log(f'Loaded Rust ckpt {args.rust_ckpt} (epoch {start_epoch})', rank)
     else:
         model = FluxModel(d=args.d, n_layers=args.layers,
                           parallel=args.parallel,
@@ -169,13 +184,11 @@ def main():
     model = model.to(device)
     n_params = model.count_params()
     mode = 'parallel' if args.parallel else 'sequential'
-    log(f'Flux v3 [{args.dtype}]: d={model.d}, layers={model.n_layers}, '
+    log(f'Flux v3 [{args.dtype}]: d={model.d}, L={model.n_layers}, '
         f'params={n_params:,}, mode={mode}', rank)
-    if args.parallel:
-        log(f'Parallel scan: n_corrections={args.n_corrections}', rank)
-        if args.resume or args.rust_ckpt:
-            raw_model = model
-            raw_model.set_mode(parallel=True, n_corrections=args.n_corrections)
+
+    if args.parallel and (args.resume or args.rust_ckpt):
+        model.set_mode(parallel=True, n_corrections=args.n_corrections)
 
     if args.grad_checkpoint:
         for layer in model.layers:
@@ -188,6 +201,9 @@ def main():
             layer.forward = make_ckpt_fwd(layer)
         log('Gradient checkpointing enabled', rank)
 
+    # Preflight: quick sanity check before committing to training
+    preflight(model, device, args.batch_size, args.seq_len, args.dtype, rank)
+
     if args.compile and hasattr(torch, 'compile'):
         model = torch.compile(model)
         log('torch.compile enabled', rank)
@@ -199,14 +215,9 @@ def main():
 
     # ── Optimizer ──
     optimizer = EntropicAdam(
-        raw_model.parameters(),
-        lr=args.lr,
-        total_epochs=args.epochs,
-    )
+        raw_model.parameters(), lr=args.lr, total_epochs=args.epochs)
     schedule = WarmRestartCosineSchedule(
-        total_epochs=args.epochs,
-        start_epoch=start_epoch,
-    )
+        total_epochs=args.epochs, start_epoch=start_epoch)
 
     # ── WandB ──
     if args.wandb and is_master:
@@ -216,17 +227,27 @@ def main():
 
     # ── Training loop ──
     os.makedirs(args.ckpt_dir, exist_ok=True)
-    log(f'Device: {device}, DDP: {ddp}, World: {world_size}, '
-        f'AMP: {use_amp}', rank)
+    log(f'Device: {device}, DDP: {ddp}, World: {world_size}, AMP: {use_amp}',
+        rank)
     t_start = time.time()
+    best_test_bpb = float('inf')
 
     for epoch in range(start_epoch + 1, args.epochs + 1):
+        if _shutdown_requested:
+            log('Shutdown signal received, saving checkpoint ...', rank)
+            if is_master:
+                ckpt_path = os.path.join(
+                    args.ckpt_dir, f'flux_interrupt_{epoch-1:04d}.pt')
+                save_pytorch(raw_model, optimizer, epoch - 1,
+                             best_test_bpb, ckpt_path)
+                log(f'  saved: {ckpt_path}', rank)
+            break
+
         t_epoch = time.time()
 
         if ddp:
             train_sampler.set_epoch(epoch)
 
-        # LR schedule
         lr_scale = schedule.get_factor(epoch)
         for pg in optimizer.param_groups:
             pg['lr'] = args.lr * lr_scale
@@ -245,44 +266,49 @@ def main():
             model.eval()
             test_loss = eval_loss(model, test_loader, amp_ctx, device)
 
-        epoch_ms = (time.time() - t_epoch) * 1000
+        epoch_s = time.time() - t_epoch
         elapsed = time.time() - t_start
         h, m, s = int(elapsed // 3600), int(elapsed % 3600 // 60), int(elapsed % 60)
 
+        train_bpb = train_loss / LN2
+        test_bpb = test_loss / LN2 if test_loss is not None else None
+        if test_bpb is not None and test_bpb < best_test_bpb:
+            best_test_bpb = test_bpb
+
         if is_master and (epoch % args.print_every == 0 or epoch == start_epoch + 1):
-            train_bpb = train_loss / LN2
-            msg = f'epoch {epoch:4d}  train_bpb={train_bpb:.3f}'
-            if test_loss is not None:
-                msg += f'  test_bpb={test_loss / LN2:.3f}'
-            msg += (f'  lr_s={lr_scale:.4f}  {epoch_ms:.0f}ms  '
-                    f'[{h:02d}:{m:02d}:{s:02d}]')
+            tokens_per_sec = len(train_ds) * args.seq_len / epoch_s
+            msg = (f'epoch {epoch:4d}  train_bpb={train_bpb:.3f}')
+            if test_bpb is not None:
+                msg += f'  test_bpb={test_bpb:.3f}'
+            msg += (f'  lr={lr_scale:.4f}  {epoch_s:.1f}s  '
+                    f'{tokens_per_sec/1000:.0f}k tok/s  [{h:02d}:{m:02d}:{s:02d}]')
             log(msg, rank)
 
             if args.wandb:
                 import wandb
                 log_dict = {
-                    'train/loss': train_loss,
-                    'train/bpb': train_bpb,
-                    'lr_scale': lr_scale,
-                    'epoch_ms': epoch_ms,
+                    'train/loss': train_loss, 'train/bpb': train_bpb,
+                    'lr_scale': lr_scale, 'epoch_s': epoch_s,
+                    'tokens_per_sec': tokens_per_sec,
                 }
                 if test_loss is not None:
                     log_dict['test/loss'] = test_loss
-                    log_dict['test/bpb'] = test_loss / LN2
+                    log_dict['test/bpb'] = test_bpb
                 wandb.log(log_dict, step=epoch)
 
-        # Save checkpoint
+        # Checkpoint
         if is_master:
             if (args.ckpt_every > 0 and epoch % args.ckpt_every == 0) \
                     or epoch == args.epochs:
                 ckpt_path = os.path.join(
                     args.ckpt_dir, f'flux_epoch_{epoch:04d}.pt')
                 save_pytorch(raw_model, optimizer, epoch, train_loss, ckpt_path)
-                log(f'  ckpt saved: {ckpt_path}', rank)
+                log(f'  ckpt: {ckpt_path}', rank)
 
+    # ── Cleanup ──
     if ddp:
         torch.distributed.destroy_process_group()
-
+    torch.cuda.empty_cache()
     log('Training complete.', rank)
 
 
@@ -311,10 +337,11 @@ def train_one_epoch(model, loader, optimizer, scaler, amp_ctx,
             scaler.update()
             optimizer.zero_grad(set_to_none=True)
 
-            # Weight decay (decoupled)
-            with torch.no_grad():
-                for p in raw.parameters():
-                    p.mul_(1.0 - wd)
+            # Decoupled weight decay
+            if wd > 0:
+                with torch.no_grad():
+                    for p in raw.parameters():
+                        p.mul_(1.0 - wd)
 
         total_loss += loss.item() * grad_accum
         n_batches += 1

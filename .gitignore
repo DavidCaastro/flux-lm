@@ -1,1 +1,24 @@
 /target
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# Training artifacts
+checkpoints/
+*.pt
+*.bin
+wandb/
+
+# Corpus files (large, generated)
+bench/corpus_test_*.txt
+bench/corpus_multilingual_*mb.txt
+bench/corpus_build.log
+
+# Vast.ai / cloud
+*.log
+.env
+
+# Screenshots
+Screenshot_*.png
