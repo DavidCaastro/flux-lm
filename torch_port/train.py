@@ -12,6 +12,7 @@ Usage:
     python train.py --corpus data.txt --ckpt flux_model.pt --resume
 """
 
+import multiprocessing
 import os
 import signal
 import sys
@@ -35,11 +36,19 @@ LN2 = 0.6931471805599453
 
 # Global flag for graceful shutdown
 _shutdown_requested = False
+_main_pid = None
 
 
 def _signal_handler(signum, frame):
     global _shutdown_requested
-    _shutdown_requested = True
+    if os.getpid() == _main_pid:
+        _shutdown_requested = True
+
+
+def _worker_init_fn(worker_id):
+    """Reset signal handlers in DataLoader workers to avoid SIGTERM interference."""
+    signal.signal(signal.SIGTERM, signal.SIG_DFL)
+    signal.signal(signal.SIGINT, signal.SIG_IGN)
 
 
 def parse_args():
@@ -68,7 +77,7 @@ def parse_args():
     p.add_argument('--wandb', action='store_true')
     p.add_argument('--wandb-project', type=str, default='flux-lm')
     p.add_argument('--print-every', type=int, default=5)
-    p.add_argument('--num-workers', type=int, default=4)
+    p.add_argument('--num-workers', type=int, default=2)
     return p.parse_args()
 
 
@@ -121,9 +130,8 @@ def preflight(model, device, batch_size, seq_len, dtype, rank):
 
 
 def main():
-    global _shutdown_requested
-    signal.signal(signal.SIGTERM, _signal_handler)
-    signal.signal(signal.SIGINT, _signal_handler)
+    global _shutdown_requested, _main_pid
+    _main_pid = os.getpid()
 
     args = parse_args()
     rank, local_rank, world_size, device, ddp = setup_ddp()
@@ -132,6 +140,7 @@ def main():
     torch.manual_seed(args.seed)
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(args.seed)
+        torch.backends.cudnn.benchmark = True
 
     # ── Precision ──
     ptdtype = {'fp32': torch.float32, 'bf16': torch.bfloat16,
@@ -153,12 +162,19 @@ def main():
         shuffle=(train_sampler is None), sampler=train_sampler,
         num_workers=wk, pin_memory=True, drop_last=True,
         persistent_workers=wk > 0,
+        worker_init_fn=_worker_init_fn,
     )
     test_loader = DataLoader(
         test_ds, batch_size=args.batch_size, shuffle=False,
         num_workers=min(wk, 2), pin_memory=True, drop_last=True,
         persistent_workers=min(wk, 2) > 0,
+        worker_init_fn=_worker_init_fn,
     )
+
+    # Register signal handlers AFTER DataLoader creation to avoid
+    # workers inheriting custom handlers that interfere with PyTorch
+    signal.signal(signal.SIGTERM, _signal_handler)
+    signal.signal(signal.SIGINT, _signal_handler)
 
     log(f'Corpus: {len(train_data)+len(test_data)} bytes '
         f'(train={len(train_data)}, test={len(test_data)}), '
@@ -314,7 +330,7 @@ def main():
 
 def train_one_epoch(model, loader, optimizer, scaler, amp_ctx,
                     device, grad_accum, max_grad_norm, wd, epoch):
-    total_loss = 0.0
+    running_loss = torch.tensor(0.0, device=device)
     n_batches = 0
     optimizer.zero_grad(set_to_none=True)
 
@@ -343,10 +359,11 @@ def train_one_epoch(model, loader, optimizer, scaler, amp_ctx,
                     for p in raw.parameters():
                         p.mul_(1.0 - wd)
 
-        total_loss += loss.item() * grad_accum
+        # Accumulate on GPU to avoid per-batch GPU-CPU sync
+        running_loss += loss.detach() * grad_accum
         n_batches += 1
 
-    return total_loss / max(n_batches, 1)
+    return running_loss.item() / max(n_batches, 1)
 
 
 @torch.no_grad()
@@ -364,4 +381,5 @@ def eval_loss(model, loader, amp_ctx, device):
 
 
 if __name__ == '__main__':
+    multiprocessing.set_start_method('spawn', force=True)
     main()

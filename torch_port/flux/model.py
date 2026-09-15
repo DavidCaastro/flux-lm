@@ -12,6 +12,12 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+try:
+    from .kernels import wht_fused, wht_scale_tanh_fused, parallel_scan_fused
+    HAS_FUSED_KERNELS = True
+except (ImportError, RuntimeError):
+    HAS_FUSED_KERNELS = False
+
 K = 4       # Semantic partition features
 STRIDE = 4  # SPM update stride
 
@@ -84,13 +90,15 @@ class FluxLayer(nn.Module):
     """
 
     def __init__(self, d: int, layer_idx: int,
-                 parallel: bool = False, n_corrections: int = 1):
+                 parallel: bool = False, n_corrections: int = 1,
+                 use_fused: bool = True):
         super().__init__()
         self.d = d
         self.layer_idx = layer_idx
         self.res_scale = 1.0 / math.log(layer_idx + 2)
         self.parallel = parallel
         self.n_corrections = n_corrections
+        self.use_fused = use_fused and HAS_FUSED_KERNELS
 
         # RMSNorm
         self.rn_gamma = nn.Parameter(torch.ones(d))
@@ -254,12 +262,20 @@ class FluxLayer(nn.Module):
 
             # State transform (all positions parallel)
             state = gate * x_norm + a_all                    # (B, T, d)
-            state = torch.tanh(self.s1 * wht(state) + self.b1)
-            state = torch.tanh(self.s2 * wht(state) + self.b2)
+            if self.use_fused and state.is_cuda:
+                state = wht_scale_tanh_fused(state, self.s1, self.b1)
+                state = wht_scale_tanh_fused(state, self.s2, self.b2)
+            else:
+                state = torch.tanh(self.s1 * wht(state) + self.b1)
+                state = torch.tanh(self.s2 * wht(state) + self.b2)
 
             # Parallel scan for both timescales
-            h_fast = parallel_scan(lam_fast, self.b_in_fast * state)
-            h_slow = parallel_scan(lam_slow, self.b_in_slow * state)
+            if self.use_fused and state.is_cuda:
+                h_fast = parallel_scan_fused(lam_fast, self.b_in_fast * state)
+                h_slow = parallel_scan_fused(lam_slow, self.b_in_slow * state)
+            else:
+                h_fast = parallel_scan(lam_fast, self.b_in_fast * state)
+                h_slow = parallel_scan(lam_slow, self.b_in_slow * state)
 
         # ── SPM (parallel) ──
         n_sub = (T + STRIDE - 1) // STRIDE
@@ -267,7 +283,10 @@ class FluxLayer(nn.Module):
         h_slow_sub = h_slow[:, idx, :]                       # (B, n_sub, d)
 
         z_sub = h_slow_sub @ spm_w.T                         # (B, n_sub, K)
-        h_sem = parallel_scan(lam_sem, (1 - lam_sem) * z_sub)
+        if self.use_fused and z_sub.is_cuda:
+            h_sem = parallel_scan_fused(lam_sem, (1 - lam_sem) * z_sub)
+        else:
+            h_sem = parallel_scan(lam_sem, (1 - lam_sem) * z_sub)
         cond_sub = (h_sem @ spm_w) * gate_sig                # (B, n_sub, d)
 
         # Broadcast cond to full resolution (hold value between updates)
@@ -296,7 +315,8 @@ class FluxModel(nn.Module):
     """
 
     def __init__(self, d: int = 256, n_layers: int = 3,
-                 parallel: bool = False, n_corrections: int = 1):
+                 parallel: bool = False, n_corrections: int = 1,
+                 use_fused: bool = True):
         super().__init__()
         assert d > 0 and (d & (d - 1)) == 0, "d must be power of 2"
         self.d = d
@@ -305,7 +325,8 @@ class FluxModel(nn.Module):
         self.embedding = nn.Embedding(256, d)
         self.spm_w = nn.Parameter(torch.empty(K, d))
         self.layers = nn.ModuleList([
-            FluxLayer(d, li, parallel=parallel, n_corrections=n_corrections)
+            FluxLayer(d, li, parallel=parallel, n_corrections=n_corrections,
+                      use_fused=use_fused)
             for li in range(n_layers)
         ])
         self.head_w = nn.Parameter(torch.empty(256, d))
@@ -339,8 +360,10 @@ class FluxModel(nn.Module):
     def count_params(self) -> int:
         return sum(p.numel() for p in self.parameters())
 
-    def set_mode(self, parallel: bool, n_corrections: int = 1):
+    def set_mode(self, parallel: bool, n_corrections: int = 1,
+                 use_fused: bool = True):
         """Switch all layers between sequential and parallel mode."""
         for layer in self.layers:
             layer.parallel = parallel
             layer.n_corrections = n_corrections
+            layer.use_fused = use_fused and HAS_FUSED_KERNELS

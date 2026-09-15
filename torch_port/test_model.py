@@ -133,6 +133,71 @@ def test_dataset():
     print(f"  Dataset: OK ({len(ds)} chunks, seq_len=32)")
 
 
+def test_fused_kernels():
+    """Test fused CUDA kernels if available."""
+    from flux.model import HAS_FUSED_KERNELS
+    if not HAS_FUSED_KERNELS:
+        print("  Fused kernels: SKIPPED (not available)")
+        return
+    if not torch.cuda.is_available():
+        print("  Fused kernels: SKIPPED (no CUDA)")
+        return
+
+    from flux.kernels import wht_fused, wht_scale_tanh_fused, parallel_scan_fused
+
+    device = 'cuda'
+    d = 256
+
+    # WHT involution
+    x = torch.randn(8, d, device=device)
+    y = wht_fused(wht_fused(x))
+    err = (y - x).abs().max().item()
+    assert err < 1e-4, f"Fused WHT involution failed: {err}"
+    print(f"  Fused WHT involution: OK (err={err:.2e})")
+
+    # WHT matches reference
+    x2 = torch.randn(4, 32, d, device=device)
+    ref = wht(x2)
+    fused = wht_fused(x2)
+    err2 = (ref - fused).abs().max().item()
+    assert err2 < 1e-4, f"Fused WHT vs reference: {err2}"
+    print(f"  Fused WHT vs reference: OK (err={err2:.2e})")
+
+    # WHT + scale + tanh
+    x3 = torch.randn(4, 32, d, device=device)
+    scale = torch.randn(d, device=device)
+    bias = torch.randn(d, device=device)
+    ref3 = torch.tanh(scale * wht(x3) + bias)
+    fused3 = wht_scale_tanh_fused(x3, scale, bias)
+    err3 = (ref3 - fused3).abs().max().item()
+    assert err3 < 1e-3, f"Fused WHT+scale+tanh: {err3}"
+    print(f"  Fused WHT+scale+tanh: OK (err={err3:.2e})")
+
+    # Parallel scan
+    B, T, D = 4, 64, 16
+    decay = torch.rand(D, device=device) * 0.5 + 0.4
+    inp = torch.randn(B, T, D, device=device)
+
+    from flux.model import parallel_scan
+    ref4 = parallel_scan(decay, inp)
+    fused4 = parallel_scan_fused(decay, inp)
+    err4 = (ref4 - fused4).abs().max().item()
+    assert err4 < 1e-3, f"Fused parallel_scan: {err4}"
+    print(f"  Fused parallel_scan: OK (err={err4:.2e})")
+
+    # WHT backward (gradcheck)
+    x_gc = torch.randn(4, d, device=device, dtype=torch.float64, requires_grad=True)
+    from flux.kernels import _WHTFunction
+    ok = torch.autograd.gradcheck(_WHTFunction.apply, (x_gc,), eps=1e-6, atol=1e-4)
+    print(f"  Fused WHT gradcheck: {'OK' if ok else 'FAILED'}")
+
+    # bf16 test
+    x_bf = torch.randn(8, d, device=device, dtype=torch.bfloat16)
+    y_bf = wht_fused(wht_fused(x_bf))
+    err_bf = (y_bf - x_bf).abs().max().item()
+    print(f"  Fused WHT bf16 involution: OK (err={err_bf:.2e})")
+
+
 if __name__ == '__main__':
     print("Flux v3 PyTorch port — validation tests\n")
     test_wht_involution()
@@ -144,4 +209,5 @@ if __name__ == '__main__':
     test_entropic_adam()
     test_cosine_schedule()
     test_dataset()
+    test_fused_kernels()
     print("\nAll tests passed.")
