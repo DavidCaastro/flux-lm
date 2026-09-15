@@ -20,6 +20,7 @@ except (ImportError, RuntimeError):
 
 K = 4       # Semantic partition features
 STRIDE = 4  # SPM update stride
+_MAX_FUSED_DIM = 1024  # CUDA max threads per block
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -98,7 +99,7 @@ class FluxLayer(nn.Module):
         self.res_scale = 1.0 / math.log(layer_idx + 2)
         self.parallel = parallel
         self.n_corrections = n_corrections
-        self.use_fused = use_fused and HAS_FUSED_KERNELS
+        self.use_fused = use_fused and HAS_FUSED_KERNELS and d <= _MAX_FUSED_DIM
 
         # RMSNorm
         self.rn_gamma = nn.Parameter(torch.ones(d))
@@ -366,4 +367,4 @@ class FluxModel(nn.Module):
         for layer in self.layers:
             layer.parallel = parallel
             layer.n_corrections = n_corrections
-            layer.use_fused = use_fused and HAS_FUSED_KERNELS
+            layer.use_fused = use_fused and HAS_FUSED_KERNELS and layer.d <= _MAX_FUSED_DIM

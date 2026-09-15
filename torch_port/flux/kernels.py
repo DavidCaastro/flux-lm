@@ -142,10 +142,21 @@ __global__ void parallel_scan_kernel(
 
 // ── C++ dispatch functions ────────────────────────────────────────────
 
+#define CUDA_CHECK_LAST_ERROR(msg) do {           \
+    cudaError_t err = cudaGetLastError();          \
+    TORCH_CHECK(err == cudaSuccess,                \
+        msg, ": ", cudaGetErrorString(err));        \
+} while(0)
+
+#define MAX_THREADS_PER_BLOCK 1024
+
 torch::Tensor wht_cuda(torch::Tensor x) {
     // x: (N, d)
     int N = x.size(0);
     int d = x.size(1);
+    TORCH_CHECK(d <= MAX_THREADS_PER_BLOCK,
+        "wht_cuda: d=", d, " exceeds max threads per block (",
+        MAX_THREADS_PER_BLOCK, "). Use PyTorch fallback for d > 1024.");
     int log_d = 0;
     for (int tmp = d; tmp > 1; tmp >>= 1) log_d++;
 
@@ -161,6 +172,7 @@ torch::Tensor wht_cuda(torch::Tensor x) {
                 d, log_d, N
             );
         });
+    CUDA_CHECK_LAST_ERROR("wht_cuda kernel launch");
 
     return out;
 }
@@ -171,6 +183,9 @@ torch::Tensor wht_scale_tanh_cuda(
     // x: (N, d), scale: (d,), bias: (d,)
     int N = x.size(0);
     int d = x.size(1);
+    TORCH_CHECK(d <= MAX_THREADS_PER_BLOCK,
+        "wht_scale_tanh_cuda: d=", d, " exceeds max threads per block (",
+        MAX_THREADS_PER_BLOCK, "). Use PyTorch fallback for d > 1024.");
     int log_d = 0;
     for (int tmp = d; tmp > 1; tmp >>= 1) log_d++;
 
@@ -188,6 +203,7 @@ torch::Tensor wht_scale_tanh_cuda(
                 d, log_d, N
             );
         });
+    CUDA_CHECK_LAST_ERROR("wht_scale_tanh_cuda kernel launch");
 
     return out;
 }
@@ -199,6 +215,9 @@ torch::Tensor parallel_scan_cuda(
     int BD = x.size(0);
     int T = x.size(1);
     int D = decay.size(0);
+    TORCH_CHECK(T <= MAX_THREADS_PER_BLOCK,
+        "parallel_scan_cuda: T=", T, " exceeds max threads per block (",
+        MAX_THREADS_PER_BLOCK, "). Use PyTorch fallback for seq_len > 1024.");
 
     auto y = torch::empty_like(x);
     int smem_bytes = T * sizeof(float);
@@ -213,6 +232,7 @@ torch::Tensor parallel_scan_cuda(
                 BD, T, D
             );
         });
+    CUDA_CHECK_LAST_ERROR("parallel_scan_cuda kernel launch");
 
     return y;
 }
@@ -238,15 +258,21 @@ def _get_module():
 
     from torch.utils.cpp_extension import load_inline
 
+    build_dir = os.path.join(os.path.dirname(__file__), '..', '.kernel_cache')
+    os.makedirs(build_dir, exist_ok=True)
+
     _module = load_inline(
         name='flux_kernels',
         cpp_sources=[_CPP_SRC],
         cuda_sources=[_CUDA_SRC],
         functions=['wht_cuda', 'wht_scale_tanh_cuda', 'parallel_scan_cuda'],
         verbose=False,
-        extra_cuda_cflags=['-O3', '--use_fast_math'],
-        build_directory=os.path.join(
-            os.path.dirname(__file__), '..', '.kernel_cache'),
+        extra_cuda_cflags=[
+            '-O3', '--use_fast_math',
+            '-gencode', 'arch=compute_89,code=sm_89',
+            '-gencode', 'arch=compute_89,code=compute_89',
+        ],
+        build_directory=build_dir,
     )
     return _module
 
@@ -383,5 +409,12 @@ def wht_scale_tanh_fused(x: torch.Tensor, scale: torch.Tensor,
 
 
 def parallel_scan_fused(decay: torch.Tensor, x: torch.Tensor) -> torch.Tensor:
-    """Fused parallel prefix scan. 3 kernel launches (transpose + scan + transpose)."""
+    """Fused parallel prefix scan. 3 kernel launches (transpose + scan + transpose).
+
+    Falls back to PyTorch if T > 1024 (CUDA max threads per block).
+    """
+    T = x.shape[1]
+    if T > 1024:
+        from .model import parallel_scan
+        return parallel_scan(decay, x)
     return _ParallelScanFunction.apply(decay, x)

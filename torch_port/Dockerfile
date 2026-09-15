@@ -1,11 +1,8 @@
-FROM nvidia/cuda:12.4.1-devel-ubuntu22.04
+FROM nvcr.io/nvidia/pytorch:26.08-py3
 
 ENV DEBIAN_FRONTEND=noninteractive
 ENV PYTHONUNBUFFERED=1
-
-RUN apt-get update && apt-get install -y --no-install-recommends \
-        python3 python3-pip git && \
-    rm -rf /var/lib/apt/lists/*
+ENV TORCH_CUDA_ARCH_LIST="8.9"
 
 WORKDIR /app
 COPY requirements.txt .

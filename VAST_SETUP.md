@@ -66,11 +66,45 @@ Para modelos pequenos (<10M params) el overhead no compensa.
 Solo vale la pena para runs muy largos (>500 epochs) donde el costo
 de compilacion se amortiza.
 
+## Instancia Vast.ai — Hardware verificado (2026-09-15)
+
+| Componente | Detalle |
+|---|---|
+| GPU | NVIDIA GeForce RTX 4090 (Ada Lovelace, sm_89, 23.5 GB, 128 SMs) |
+| Driver | 580.159.03 |
+| CUDA (driver) | 13.4 |
+| CUDA Toolkit (nvcc) | 13.4 V13.4.59 |
+| PyTorch | 2.14.0a0+nv26.08 (NGC custom) |
+| cuDNN | 92500 |
+| Triton | 3.8.0+nv26.8 |
+| Python | 3.12.3 |
+| OS | Ubuntu 24.04.4 LTS |
+| CPU | AMD EPYC 7542 (128 threads) |
+| RAM | 251 GB |
+| Disco | 32 GB overlay |
+| gcc/g++ | 13.3.0 |
+| ninja | 1.13.0 |
+| wandb | 0.28.2 |
+| tmux | 3.4 |
+
+### SSH
+```
+Host vast
+    HostName 137.175.76.24
+    Port 41982
+    User root
+    IdentityFile ~/.ssh/id_vast
+```
+
 ## Configuracion optima para RTX 4090
 
 ```bash
-# Config probada y verificada:
-python train.py --corpus /workspace/corpus_100mb.txt \
+# Asegurar CUDA arch para sm_89
+export TORCH_CUDA_ARCH_LIST="8.9"
+
+# Config probada:
+cd /workspace/flux-lm/torch_port
+python3 train.py --corpus /workspace/corpus_100mb.txt \
     --d 512 --layers 12 --epochs 250 \
     --batch-size 64 --seq-len 256 \
     --dtype bf16 --parallel \
@@ -79,14 +113,14 @@ python train.py --corpus /workspace/corpus_100mb.txt \
 
 # VRAM esperado: ~8-15 GB de 24 GB
 # Throughput esperado: ~25-40K tok/s
-# Tiempo por epoch: ~50-70 min
 ```
 
 ## Checklist pre-ejecucion
 
 1. [ ] Verificar GPU: `nvidia-smi`
-2. [ ] Matar procesos previos: `pkill -f python` (excepto jupyter)
-3. [ ] Verificar corpus: `ls -lh /workspace/corpus_100mb.txt`
-4. [ ] Usar tmux: `tmux new -s train`
-5. [ ] Usar nohup si no hay tmux: `nohup python train.py ... > train.log 2>&1 &`
-6. [ ] Monitorear: `tail -f train.log` o wandb
+2. [ ] Verificar arch: `echo $TORCH_CUDA_ARCH_LIST` (debe ser "8.9")
+3. [ ] Matar procesos previos: `pkill -f python` (excepto jupyter)
+4. [ ] Limpiar kernel cache viejo: `rm -rf /workspace/flux-lm/torch_port/.kernel_cache`
+5. [ ] Verificar corpus: `ls -lh /workspace/corpus_100mb.txt`
+6. [ ] Usar tmux: `tmux new -s train`
+7. [ ] Monitorear: `watch nvidia-smi` o wandb
