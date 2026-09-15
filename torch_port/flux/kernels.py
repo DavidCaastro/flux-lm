@@ -1,15 +1,25 @@
-"""Fused CUDA kernels for Flux v3: WHT + scale + tanh, parallel scan.
+"""Fused CUDA kernels for Flux v3 — INSTRUMENTED with logging.
 
-Uses torch.utils.cpp_extension.load_inline to JIT-compile CUDA kernels
-with __syncthreads() for proper butterfly synchronization.
-
-Falls back gracefully to pure-PyTorch ops on CPU or if compilation fails.
+JIT compilation and first N kernel calls are logged to diagnose hangs.
 """
 
 import math
 import os
+import time
 import torch
 import torch.nn.functional as F
+
+# ── Kernel logging ────────────────────────────────────────────────────
+_kernel_call_count = {'wht': 0, 'wht_st': 0, 'scan': 0}
+_KERNEL_LOG_UNTIL = 5  # Log first N calls to each kernel
+
+
+def _klog(msg):
+    t = time.time()
+    ts = time.strftime('%H:%M:%S', time.localtime(t))
+    ms = int((t % 1) * 1000)
+    print(f'[{ts}.{ms:03d}] [KERNEL] {msg}', flush=True)
+
 
 # ═══════════════════════════════════════════════════════════════════════
 # CUDA source code
@@ -256,24 +266,36 @@ def _get_module():
     if _module is not None:
         return _module
 
+    _klog("JIT compilando kernels CUDA (esto puede tardar ~60s)...")
+    t0 = time.time()
+
     from torch.utils.cpp_extension import load_inline
 
     build_dir = os.path.join(os.path.dirname(__file__), '..', '.kernel_cache')
     os.makedirs(build_dir, exist_ok=True)
+    _klog(f"  build_dir={os.path.abspath(build_dir)}")
 
-    _module = load_inline(
-        name='flux_kernels',
-        cpp_sources=[_CPP_SRC],
-        cuda_sources=[_CUDA_SRC],
-        functions=['wht_cuda', 'wht_scale_tanh_cuda', 'parallel_scan_cuda'],
-        verbose=False,
-        extra_cuda_cflags=[
-            '-O3', '--use_fast_math',
-            '-gencode', 'arch=compute_89,code=sm_89',
-            '-gencode', 'arch=compute_89,code=compute_89',
-        ],
-        build_directory=build_dir,
-    )
+    try:
+        _module = load_inline(
+            name='flux_kernels',
+            cpp_sources=[_CPP_SRC],
+            cuda_sources=[_CUDA_SRC],
+            functions=['wht_cuda', 'wht_scale_tanh_cuda', 'parallel_scan_cuda'],
+            verbose=False,
+            extra_cuda_cflags=[
+                '-O3', '--use_fast_math',
+                '-gencode', 'arch=compute_89,code=sm_89',
+                '-gencode', 'arch=compute_89,code=compute_89',
+            ],
+            build_directory=build_dir,
+        )
+        dt = time.time() - t0
+        _klog(f"  Kernels CUDA compilados OK en {dt:.1f}s")
+    except Exception as e:
+        dt = time.time() - t0
+        _klog(f"  FALLO compilacion kernels tras {dt:.1f}s: {e}")
+        raise
+
     return _module
 
 
@@ -289,7 +311,18 @@ class _WHTFunction(torch.autograd.Function):
         batch_shape = x.shape[:-1]
         d = x.shape[-1]
         flat = x.reshape(-1, d).contiguous()
+
+        cc = _kernel_call_count
+        cc['wht'] += 1
+        if cc['wht'] <= _KERNEL_LOG_UNTIL:
+            _klog(f"WHT forward #{cc['wht']}: flat.shape={list(flat.shape)}, "
+                  f"dtype={flat.dtype}")
+
+        t0 = time.time()
         out = _get_module().wht_cuda(flat)
+        if cc['wht'] <= _KERNEL_LOG_UNTIL:
+            _klog(f"WHT forward #{cc['wht']}: OK ({time.time()-t0:.4f}s)")
+
         return out.reshape(*batch_shape, d)
 
     @staticmethod
@@ -302,13 +335,7 @@ class _WHTFunction(torch.autograd.Function):
 
 
 class _WHTScaleTanhFunction(torch.autograd.Function):
-    """Fused: tanh(scale * WHT(x) + bias).
-
-    Backward:
-      d/dx = diag(1 - tanh²) · diag(scale) · WHT · grad
-      d/d_scale = (1 - tanh²) * WHT(x)  (per-element, then sum over batch)
-      d/d_bias = (1 - tanh²)  (sum over batch)
-    """
+    """Fused: tanh(scale * WHT(x) + bias)."""
 
     @staticmethod
     def forward(ctx, x, scale, bias):
@@ -316,10 +343,24 @@ class _WHTScaleTanhFunction(torch.autograd.Function):
         d = x.shape[-1]
         flat = x.reshape(-1, d).contiguous()
 
-        # We need WHT(x) for backward, compute it
+        cc = _kernel_call_count
+        cc['wht_st'] += 1
+        log = cc['wht_st'] <= _KERNEL_LOG_UNTIL
+        if log:
+            _klog(f"WHT_ST forward #{cc['wht_st']}: flat.shape={list(flat.shape)}, "
+                  f"scale.shape={list(scale.shape)}, dtype={flat.dtype}")
+
+        t0 = time.time()
         mod = _get_module()
         wht_x = mod.wht_cuda(flat)
+        if log:
+            _klog(f"WHT_ST #{cc['wht_st']}: wht_cuda OK ({time.time()-t0:.4f}s)")
+
+        t1 = time.time()
         out = torch.tanh(scale * wht_x + bias)
+        if log:
+            _klog(f"WHT_ST #{cc['wht_st']}: tanh OK ({time.time()-t1:.4f}s), "
+                  f"total={time.time()-t0:.4f}s")
 
         ctx.save_for_backward(wht_x, scale, out)
         ctx.batch_shape = batch_shape
@@ -332,17 +373,11 @@ class _WHTScaleTanhFunction(torch.autograd.Function):
         d = grad_output.shape[-1]
         grad = grad_output.reshape(-1, d)
 
-        # dtanh = 1 - tanh²
-        dtanh = 1.0 - tanh_out * tanh_out  # (N, d)
-
-        # grad_bias = sum over batch of (dtanh * grad)
-        common = dtanh * grad  # (N, d)
+        dtanh = 1.0 - tanh_out * tanh_out
+        common = dtanh * grad
         grad_bias = common.sum(dim=0)
-
-        # grad_scale = sum over batch of (dtanh * grad * wht_x)
         grad_scale = (common * wht_x).sum(dim=0)
 
-        # grad_x = WHT(scale * dtanh * grad)  — WHT is self-adjoint
         mod = _get_module()
         grad_x_flat = mod.wht_cuda((scale * common).contiguous())
 
@@ -350,22 +385,35 @@ class _WHTScaleTanhFunction(torch.autograd.Function):
 
 
 class _ParallelScanFunction(torch.autograd.Function):
-    """Fused parallel prefix scan: y[t] = decay * y[t-1] + x[t].
-
-    Backward: reverse scan — grad_x[t] = grad_y[t] + decay * grad_x[t+1].
-    This is equivalent to a forward scan on the time-reversed gradient.
-    """
+    """Fused parallel prefix scan: y[t] = decay * y[t-1] + x[t]."""
 
     @staticmethod
     def forward(ctx, decay, x):
-        # x: (B, T, D), decay: (D,)
         B, T, D = x.shape
+
+        cc = _kernel_call_count
+        cc['scan'] += 1
+        log = cc['scan'] <= _KERNEL_LOG_UNTIL
+        if log:
+            _klog(f"SCAN forward #{cc['scan']}: B={B} T={T} D={D}, "
+                  f"dtype={x.dtype}, decay.shape={list(decay.shape)}")
+
+        t0 = time.time()
         mod = _get_module()
 
-        # Transpose to (B, D, T) -> (B*D, T) for kernel
         xt = x.transpose(1, 2).contiguous().reshape(B * D, T)
+        if log:
+            _klog(f"SCAN #{cc['scan']}: transpose OK, "
+                  f"xt.shape={list(xt.shape)}")
+
+        t1 = time.time()
         yt = mod.parallel_scan_cuda(decay, xt)
+        if log:
+            _klog(f"SCAN #{cc['scan']}: kernel OK ({time.time()-t1:.4f}s)")
+
         y = yt.reshape(B, D, T).transpose(1, 2).contiguous()
+        if log:
+            _klog(f"SCAN #{cc['scan']}: reshape OK, total={time.time()-t0:.4f}s")
 
         ctx.save_for_backward(decay, y)
         ctx.shape = (B, T, D)
@@ -377,13 +425,10 @@ class _ParallelScanFunction(torch.autograd.Function):
         B, T, D = ctx.shape
         mod = _get_module()
 
-        # Reverse scan: flip time, scan, flip back
-        # This computes the adjoint λ[t] = grad_output[t] + decay · λ[t+1]
         grad_flip = grad_output.flip(1).transpose(1, 2).contiguous().reshape(B * D, T)
         grad_scan = mod.parallel_scan_cuda(decay, grad_flip)
         grad_x = grad_scan.reshape(B, D, T).transpose(1, 2).contiguous().flip(1)
 
-        # grad_decay[d] = Σ_{b,t} adjoint[b,t,d] · y[b,t-1,d]
         y_prev = F.pad(y[:, :-1, :], (0, 0, 1, 0))
         grad_decay = (grad_x * y_prev).sum(dim=(0, 1))
 
@@ -401,17 +446,18 @@ def wht_fused(x: torch.Tensor) -> torch.Tensor:
 
 def wht_scale_tanh_fused(x: torch.Tensor, scale: torch.Tensor,
                           bias: torch.Tensor) -> torch.Tensor:
-    """Fused tanh(scale * WHT(x) + bias). 2 kernel launches (WHT + fused read)."""
+    """Fused tanh(scale * WHT(x) + bias). 2 kernel launches."""
     return _WHTScaleTanhFunction.apply(x, scale, bias)
 
 
 def parallel_scan_fused(decay: torch.Tensor, x: torch.Tensor) -> torch.Tensor:
-    """Fused parallel prefix scan. 3 kernel launches (transpose + scan + transpose).
+    """Fused parallel prefix scan.
 
     Falls back to PyTorch if T > 1024 (CUDA max threads per block).
     """
     T = x.shape[1]
     if T > 1024:
+        _klog(f"SCAN fallback: T={T} > 1024, usando PyTorch")
         from .model import parallel_scan
         return parallel_scan(decay, x)
     return _ParallelScanFunction.apply(decay, x)

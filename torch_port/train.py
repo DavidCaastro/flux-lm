@@ -1,15 +1,8 @@
 #!/usr/bin/env python3
-"""Flux v3 training — GPU-ready with DDP, AMP, gradient accumulation, wandb.
+"""Flux v3 training — INSTRUMENTED: ultra-verbose logging + watchdog timeout.
 
-Usage:
-  Single GPU:
-    python train.py --corpus data.txt --d 256 --layers 6
-
-  Multi-GPU (DDP):
-    torchrun --nproc_per_node=4 train.py --corpus data.txt --d 512 --layers 12
-
-  Resume from checkpoint:
-    python train.py --corpus data.txt --ckpt flux_model.pt --resume
+Every operation logs BEFORE it starts so the last log line reveals where a hang occurs.
+Watchdog thread kills the process if no heartbeat for 180s.
 """
 
 import multiprocessing
@@ -19,6 +12,8 @@ import sys
 import math
 import time
 import argparse
+import threading
+import traceback
 from contextlib import nullcontext
 
 import torch
@@ -27,7 +22,7 @@ from torch.utils.data import DataLoader
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data.distributed import DistributedSampler
 
-from flux.model import FluxModel
+from flux.model import FluxModel, reset_debug_counters
 from flux.optim import EntropicAdam, WarmRestartCosineSchedule
 from flux.data import ByteCorpusDataset, load_corpus
 from flux.checkpoint import save_pytorch, load_pytorch, load_rust_checkpoint
@@ -38,6 +33,52 @@ LN2 = 0.6931471805599453
 _shutdown_requested = False
 _main_pid = None
 
+# ── Watchdog ──────────────────────────────────────────────────────────
+_last_heartbeat = time.time()
+_heartbeat_label = "init"
+WATCHDOG_TIMEOUT = 180  # seconds without heartbeat → kill
+
+
+def heartbeat(label):
+    global _last_heartbeat, _heartbeat_label
+    _last_heartbeat = time.time()
+    _heartbeat_label = label
+
+
+def tlog(msg):
+    """Timestamped log with milliseconds, always flushed."""
+    t = time.time()
+    ts = time.strftime('%H:%M:%S', time.localtime(t))
+    ms = int((t % 1) * 1000)
+    print(f'[{ts}.{ms:03d}] {msg}', flush=True)
+
+
+def _watchdog_fn():
+    """Background thread: kills process if no heartbeat for WATCHDOG_TIMEOUT seconds."""
+    while True:
+        time.sleep(5)
+        elapsed = time.time() - _last_heartbeat
+        if elapsed > WATCHDOG_TIMEOUT:
+            tlog("=" * 70)
+            tlog(f"WATCHDOG TIMEOUT: {elapsed:.0f}s sin heartbeat!")
+            tlog(f"Ultimo heartbeat: '{_heartbeat_label}'")
+            tlog("Stack traces de todos los threads:")
+            for tid, frame in sys._current_frames().items():
+                tlog(f"  --- Thread {tid} ---")
+                for line in traceback.format_stack(frame):
+                    for subline in line.strip().split('\n'):
+                        tlog(f"    {subline}")
+            tlog("=" * 70)
+            tlog("MATANDO PROCESO POR TIMEOUT")
+            os._exit(1)
+
+
+def vram():
+    """Current VRAM usage string."""
+    if torch.cuda.is_available():
+        return f"{torch.cuda.memory_allocated()/1024**3:.2f}GB"
+    return "N/A"
+
 
 def _signal_handler(signum, frame):
     global _shutdown_requested
@@ -46,7 +87,6 @@ def _signal_handler(signum, frame):
 
 
 def _worker_init_fn(worker_id):
-    """Reset signal handlers in DataLoader workers to avoid SIGTERM interference."""
     signal.signal(signal.SIGTERM, signal.SIG_DFL)
     signal.signal(signal.SIGINT, signal.SIG_IGN)
 
@@ -100,47 +140,84 @@ def setup_ddp():
 
 def log(msg, rank=0):
     if rank == 0:
-        ts = time.strftime('%Y-%m-%d %H:%M:%S')
-        print(f'[{ts}] {msg}', flush=True)
+        tlog(msg)
 
 
 def preflight(model, device, batch_size, seq_len, dtype, rank):
     """Quick forward+backward check before training starts."""
     log('Preflight check ...', rank)
-    x = torch.randint(0, 256, (min(batch_size, 4), seq_len), device=device)
-    y = torch.randint(0, 256, (min(batch_size, 4), seq_len), device=device)
+    heartbeat("preflight: creating random tensors")
+
+    bs = min(batch_size, 4)
+    tlog(f"  preflight: creando tensores x,y shape=({bs}, {seq_len}) en {device}")
+    x = torch.randint(0, 256, (bs, seq_len), device=device)
+    y = torch.randint(0, 256, (bs, seq_len), device=device)
+    tlog(f"  preflight: tensores creados, VRAM={vram()}")
+
     ptdtype = {'fp32': torch.float32, 'bf16': torch.bfloat16,
                'fp16': torch.float16}[dtype]
     use_amp = dtype != 'fp32' and device != 'cpu'
     ctx = torch.autocast('cuda', dtype=ptdtype) if use_amp else nullcontext()
+
     try:
+        heartbeat("preflight: forward")
+        tlog(f"  preflight: FORWARD (AMP={use_amp}, dtype={ptdtype})...")
+        t0 = time.time()
         with ctx:
             _, loss = model(x, y)
+        torch.cuda.synchronize()
+        tlog(f"  preflight: FORWARD OK en {time.time()-t0:.3f}s, "
+             f"loss={loss.item():.4f}, VRAM={vram()}")
+
+        heartbeat("preflight: backward")
+        tlog(f"  preflight: BACKWARD...")
+        t0 = time.time()
         loss.backward()
+        torch.cuda.synchronize()
+        tlog(f"  preflight: BACKWARD OK en {time.time()-t0:.3f}s, VRAM={vram()}")
+
+        heartbeat("preflight: zero_grad")
         model.zero_grad(set_to_none=True)
         torch.cuda.synchronize()
         mem = torch.cuda.max_memory_allocated() / 1024**3
-        log(f'  OK: loss={loss.item():.4f}, peak_vram={mem:.1f}GB', rank)
+        tlog(f"  preflight: PASS — loss={loss.item():.4f}, peak_vram={mem:.1f}GB")
         torch.cuda.reset_peak_memory_stats()
-    except RuntimeError as e:
-        log(f'  FAILED: {e}', rank)
+    except Exception as e:
+        tlog(f"  preflight: FAILED: {e}")
+        traceback.print_exc()
         sys.exit(1)
+
     del x, y
     torch.cuda.empty_cache()
+    heartbeat("preflight: done")
 
 
 def main():
     global _shutdown_requested, _main_pid
     _main_pid = os.getpid()
 
+    # Start watchdog
+    wd_thread = threading.Thread(target=_watchdog_fn, daemon=True)
+    wd_thread.start()
+    tlog(f"Watchdog thread iniciado (timeout={WATCHDOG_TIMEOUT}s)")
+    heartbeat("main: parsing args")
+
     args = parse_args()
+    tlog(f"Args: {vars(args)}")
+
+    heartbeat("main: setup DDP")
     rank, local_rank, world_size, device, ddp = setup_ddp()
     is_master = rank == 0
+    tlog(f"DDP: rank={rank}, local_rank={local_rank}, world={world_size}, "
+         f"device={device}, ddp={ddp}")
 
+    heartbeat("main: seeds + CUDA info")
     torch.manual_seed(args.seed)
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(args.seed)
         torch.backends.cudnn.benchmark = True
+        tlog(f"CUDA: {torch.cuda.get_device_name()}, "
+             f"CC={torch.cuda.get_device_capability()}, VRAM={vram()}")
 
     # ── Precision ──
     ptdtype = {'fp32': torch.float32, 'bf16': torch.bfloat16,
@@ -149,12 +226,25 @@ def main():
     amp_ctx = (torch.autocast(device_type='cuda', dtype=ptdtype)
                if use_amp else nullcontext())
     scaler = torch.GradScaler('cuda', enabled=(args.dtype == 'fp16'))
+    tlog(f"Precision: dtype={args.dtype}, ptdtype={ptdtype}, "
+         f"use_amp={use_amp}, scaler_enabled={args.dtype == 'fp16'}")
 
     # ── Data ──
+    heartbeat("main: loading corpus")
+    tlog(f"Cargando corpus desde {args.corpus}...")
+    t0 = time.time()
     train_data, test_data = load_corpus(args.corpus)
+    tlog(f"Corpus cargado en {time.time()-t0:.2f}s: "
+         f"train={len(train_data)} bytes, test={len(test_data)} bytes")
+
+    heartbeat("main: creating datasets")
+    tlog("Creando datasets...")
     train_ds = ByteCorpusDataset(train_data, args.seq_len)
     test_ds = ByteCorpusDataset(test_data, args.seq_len)
+    tlog(f"Datasets: train={len(train_ds)} chunks, test={len(test_ds)} chunks")
 
+    heartbeat("main: creating dataloaders")
+    tlog(f"Creando DataLoaders (num_workers={args.num_workers})...")
     train_sampler = DistributedSampler(train_ds, shuffle=True) if ddp else None
     wk = args.num_workers
     train_loader = DataLoader(
@@ -170,38 +260,40 @@ def main():
         persistent_workers=min(wk, 2) > 0,
         worker_init_fn=_worker_init_fn,
     )
+    tlog(f"DataLoaders OK: train={len(train_loader)} batches, "
+         f"test={len(test_loader)} batches")
 
-    # Register signal handlers AFTER DataLoader creation to avoid
-    # workers inheriting custom handlers that interfere with PyTorch
     signal.signal(signal.SIGTERM, _signal_handler)
     signal.signal(signal.SIGINT, _signal_handler)
 
-    log(f'Corpus: {len(train_data)+len(test_data)} bytes '
-        f'(train={len(train_data)}, test={len(test_data)}), '
-        f'seq_len={args.seq_len}', rank)
-    log(f'Train: {len(train_ds)} chunks, {len(train_ds)//args.batch_size} '
-        f'batches/epoch | Test: {len(test_ds)} chunks', rank)
-
     # ── Model ──
+    heartbeat("main: creating model")
+    tlog("Creando modelo...")
     start_epoch = 0
     if args.resume and args.ckpt and os.path.exists(args.ckpt):
         model, ckpt_info = load_pytorch(args.ckpt, device='cpu')
         start_epoch = ckpt_info['epoch']
-        log(f'Resumed from {args.ckpt} (epoch {start_epoch})', rank)
+        tlog(f'Resumed from {args.ckpt} (epoch {start_epoch})')
     elif args.rust_ckpt:
         model, ckpt_info = load_rust_checkpoint(args.rust_ckpt)
         start_epoch = ckpt_info['epoch']
-        log(f'Loaded Rust ckpt {args.rust_ckpt} (epoch {start_epoch})', rank)
+        tlog(f'Loaded Rust ckpt {args.rust_ckpt} (epoch {start_epoch})')
     else:
         model = FluxModel(d=args.d, n_layers=args.layers,
                           parallel=args.parallel,
                           n_corrections=args.n_corrections)
+    tlog("Modelo creado en CPU")
 
+    heartbeat("main: model to device")
+    tlog(f"Moviendo modelo a {device}...")
+    t0 = time.time()
     model = model.to(device)
+    tlog(f"Modelo en {device} en {time.time()-t0:.2f}s, VRAM={vram()}")
+
     n_params = model.count_params()
     mode = 'parallel' if args.parallel else 'sequential'
-    log(f'Flux v3 [{args.dtype}]: d={model.d}, L={model.n_layers}, '
-        f'params={n_params:,}, mode={mode}', rank)
+    tlog(f'Flux v3 [{args.dtype}]: d={model.d}, L={model.n_layers}, '
+         f'params={n_params:,}, mode={mode}')
 
     if args.parallel and (args.resume or args.rust_ckpt):
         model.set_mode(parallel=True, n_corrections=args.n_corrections)
@@ -215,14 +307,20 @@ def main():
                         mod._orig_forward, *a, use_reentrant=False, **kw)
                 return ckpt_fwd
             layer.forward = make_ckpt_fwd(layer)
-        log('Gradient checkpointing enabled', rank)
+        tlog('Gradient checkpointing enabled')
 
-    # Preflight: quick sanity check before committing to training
+    # Preflight
     preflight(model, device, args.batch_size, args.seq_len, args.dtype, rank)
 
+    # Reset debug counters so training logging starts fresh
+    reset_debug_counters()
+
     if args.compile and hasattr(torch, 'compile'):
+        heartbeat("main: torch.compile")
+        tlog("torch.compile...")
+        t0 = time.time()
         model = torch.compile(model)
-        log('torch.compile enabled', rank)
+        tlog(f'torch.compile OK en {time.time()-t0:.2f}s')
 
     if ddp:
         model = DDP(model, device_ids=[local_rank])
@@ -230,10 +328,13 @@ def main():
     raw_model = model.module if ddp else model
 
     # ── Optimizer ──
+    heartbeat("main: creating optimizer")
+    tlog("Creando EntropicAdam + WarmRestartCosineSchedule...")
     optimizer = EntropicAdam(
         raw_model.parameters(), lr=args.lr, total_epochs=args.epochs)
     schedule = WarmRestartCosineSchedule(
         total_epochs=args.epochs, start_epoch=start_epoch)
+    tlog("Optimizer y schedule creados")
 
     # ── WandB ──
     if args.wandb and is_master:
@@ -243,23 +344,27 @@ def main():
 
     # ── Training loop ──
     os.makedirs(args.ckpt_dir, exist_ok=True)
-    log(f'Device: {device}, DDP: {ddp}, World: {world_size}, AMP: {use_amp}',
-        rank)
+    tlog(f'Device: {device}, DDP: {ddp}, World: {world_size}, AMP: {use_amp}')
+    tlog("=" * 70)
+    tlog("INICIANDO TRAINING LOOP")
+    tlog("=" * 70)
     t_start = time.time()
     best_test_bpb = float('inf')
 
     for epoch in range(start_epoch + 1, args.epochs + 1):
         if _shutdown_requested:
-            log('Shutdown signal received, saving checkpoint ...', rank)
+            tlog('Shutdown signal, saving checkpoint...')
             if is_master:
                 ckpt_path = os.path.join(
                     args.ckpt_dir, f'flux_interrupt_{epoch-1:04d}.pt')
                 save_pytorch(raw_model, optimizer, epoch - 1,
                              best_test_bpb, ckpt_path)
-                log(f'  saved: {ckpt_path}', rank)
+                tlog(f'  saved: {ckpt_path}')
             break
 
         t_epoch = time.time()
+        heartbeat(f"epoch {epoch}: start")
+        tlog(f"{'='*50} EPOCH {epoch}/{args.epochs} {'='*50}")
 
         if ddp:
             train_sampler.set_epoch(epoch)
@@ -267,20 +372,29 @@ def main():
         lr_scale = schedule.get_factor(epoch)
         for pg in optimizer.param_groups:
             pg['lr'] = args.lr * lr_scale
+        tlog(f"  lr_scale={lr_scale:.6f}, lr_eff={args.lr * lr_scale:.6e}")
 
-        # Train
+        # ── Train ──
+        heartbeat(f"epoch {epoch}: train start")
+        tlog(f"  TRAIN: entrando train_one_epoch...")
         model.train()
         train_loss = train_one_epoch(
             model, train_loader, optimizer, scaler, amp_ctx,
             device, args.grad_accum, args.max_grad_norm,
             args.weight_decay, epoch,
         )
+        heartbeat(f"epoch {epoch}: train done")
+        tlog(f"  TRAIN OK: loss={train_loss:.6f}, VRAM={vram()}")
 
-        # Eval
+        # ── Eval ──
         test_loss = None
         if len(test_ds) > 0:
+            heartbeat(f"epoch {epoch}: eval start")
+            tlog(f"  EVAL: entrando eval_loss...")
             model.eval()
-            test_loss = eval_loss(model, test_loader, amp_ctx, device)
+            test_loss = eval_loss(model, test_loader, amp_ctx, device, epoch)
+            heartbeat(f"epoch {epoch}: eval done")
+            tlog(f"  EVAL OK: loss={test_loss:.6f}")
 
         epoch_s = time.time() - t_epoch
         elapsed = time.time() - t_start
@@ -291,14 +405,15 @@ def main():
         if test_bpb is not None and test_bpb < best_test_bpb:
             best_test_bpb = test_bpb
 
-        if is_master and (epoch % args.print_every == 0 or epoch == start_epoch + 1):
+        if is_master and (epoch % args.print_every == 0
+                          or epoch == start_epoch + 1):
             tokens_per_sec = len(train_ds) * args.seq_len / epoch_s
-            msg = (f'epoch {epoch:4d}  train_bpb={train_bpb:.3f}')
+            msg = f'epoch {epoch:4d}  train_bpb={train_bpb:.3f}'
             if test_bpb is not None:
                 msg += f'  test_bpb={test_bpb:.3f}'
             msg += (f'  lr={lr_scale:.4f}  {epoch_s:.1f}s  '
                     f'{tokens_per_sec/1000:.0f}k tok/s  [{h:02d}:{m:02d}:{s:02d}]')
-            log(msg, rank)
+            tlog(msg)
 
             if args.wandb:
                 import wandb
@@ -312,72 +427,186 @@ def main():
                     log_dict['test/bpb'] = test_bpb
                 wandb.log(log_dict, step=epoch)
 
-        # Checkpoint
+        # ── Checkpoint ──
         if is_master:
             if (args.ckpt_every > 0 and epoch % args.ckpt_every == 0) \
                     or epoch == args.epochs:
+                heartbeat(f"epoch {epoch}: saving ckpt")
                 ckpt_path = os.path.join(
                     args.ckpt_dir, f'flux_epoch_{epoch:04d}.pt')
+                tlog(f"  Guardando checkpoint: {ckpt_path}...")
                 save_pytorch(raw_model, optimizer, epoch, train_loss, ckpt_path)
-                log(f'  ckpt: {ckpt_path}', rank)
+                tlog(f'  ckpt guardado OK')
+
+        heartbeat(f"epoch {epoch}: done")
+        tlog(f"  EPOCH {epoch} COMPLETADA en {epoch_s:.1f}s, VRAM={vram()}")
 
     # ── Cleanup ──
     if ddp:
         torch.distributed.destroy_process_group()
     torch.cuda.empty_cache()
-    log('Training complete.', rank)
+    tlog('Training complete.')
 
 
 def train_one_epoch(model, loader, optimizer, scaler, amp_ctx,
                     device, grad_accum, max_grad_norm, wd, epoch):
     running_loss = torch.tensor(0.0, device=device)
     n_batches = 0
+    total_batches = len(loader)
     optimizer.zero_grad(set_to_none=True)
 
+    tlog(f"    train_one_epoch: {total_batches} batches, "
+         f"grad_accum={grad_accum}")
+
+    t_data_start = time.time()
+
     for step, (x, y) in enumerate(loader):
+        t_data = time.time() - t_data_start
+        t_step_start = time.time()
+        heartbeat(f"epoch {epoch}, batch {step+1}/{total_batches}")
+
+        # Verbose for first 15, every 200th, and last batch
+        verbose = (step < 15) or (step % 200 == 0) or (step == total_batches - 1)
+
+        bp = f"E{epoch} B{step+1}/{total_batches}"
+
+        if verbose:
+            tlog(f"    [{bp}] x.shape={list(x.shape)}, "
+                 f"data_load={t_data:.3f}s, VRAM={vram()}")
+
+        # ── To device ──
+        if verbose:
+            tlog(f"    [{bp}] x,y → {device}...")
+        t0 = time.time()
         x = x.to(device, non_blocking=True)
         y = y.to(device, non_blocking=True)
+        t_transfer = time.time() - t0
+        if verbose:
+            tlog(f"    [{bp}] transfer={t_transfer:.4f}s")
 
-        with amp_ctx:
-            _, loss = model(x, y)
-            loss = loss / grad_accum
+        # ── Forward ──
+        if verbose:
+            tlog(f"    [{bp}] FORWARD start...")
+        t0 = time.time()
+        try:
+            with amp_ctx:
+                _, loss = model(x, y)
+                loss = loss / grad_accum
+        except Exception as e:
+            tlog(f"    [{bp}] FORWARD EXCEPTION: {e}")
+            traceback.print_exc()
+            raise
 
-        scaler.scale(loss).backward()
+        if verbose:
+            torch.cuda.synchronize()
+            t_fwd = time.time() - t0
+            loss_val = loss.item() * grad_accum
+            tlog(f"    [{bp}] FORWARD done={t_fwd:.3f}s, "
+                 f"loss={loss_val:.4f}, VRAM={vram()}")
 
-        if (step + 1) % grad_accum == 0 or (step + 1) == len(loader):
-            scaler.unscale_(optimizer)
-            raw = model.module if hasattr(model, 'module') else model
-            torch.nn.utils.clip_grad_norm_(raw.parameters(), max_grad_norm)
+        # ── Backward ──
+        if verbose:
+            tlog(f"    [{bp}] BACKWARD start...")
+        t0 = time.time()
+        try:
+            scaler.scale(loss).backward()
+        except Exception as e:
+            tlog(f"    [{bp}] BACKWARD EXCEPTION: {e}")
+            traceback.print_exc()
+            raise
 
-            scaler.step(optimizer, epoch=epoch)
-            scaler.update()
-            optimizer.zero_grad(set_to_none=True)
+        if verbose:
+            torch.cuda.synchronize()
+            t_bwd = time.time() - t0
+            tlog(f"    [{bp}] BACKWARD done={t_bwd:.3f}s, VRAM={vram()}")
 
-            # Decoupled weight decay
-            if wd > 0:
-                with torch.no_grad():
-                    for p in raw.parameters():
-                        p.mul_(1.0 - wd)
+        # ── Optimizer step ──
+        if (step + 1) % grad_accum == 0 or (step + 1) == total_batches:
+            if verbose:
+                tlog(f"    [{bp}] OPTIMIZER step start...")
+            t0 = time.time()
+            try:
+                scaler.unscale_(optimizer)
+                raw = model.module if hasattr(model, 'module') else model
+                gn = torch.nn.utils.clip_grad_norm_(raw.parameters(),
+                                                     max_grad_norm)
+                if verbose:
+                    tlog(f"    [{bp}] grad_norm={gn:.4f}, "
+                         f"calling scaler.step...")
+                scaler.step(optimizer, epoch=epoch)
+                scaler.update()
+                optimizer.zero_grad(set_to_none=True)
 
-        # Accumulate on GPU to avoid per-batch GPU-CPU sync
+                if wd > 0:
+                    with torch.no_grad():
+                        for p in raw.parameters():
+                            p.mul_(1.0 - wd)
+            except Exception as e:
+                tlog(f"    [{bp}] OPTIMIZER EXCEPTION: {e}")
+                traceback.print_exc()
+                raise
+
+            if verbose:
+                torch.cuda.synchronize()
+                t_opt = time.time() - t0
+                tlog(f"    [{bp}] OPTIMIZER done={t_opt:.3f}s, VRAM={vram()}")
+
+                # NaN check on all parameters after optimizer step
+                tlog(f"    [{bp}] NaN check on weights...")
+                for pname, pp in raw.named_parameters():
+                    if pp.isnan().any().item():
+                        tlog(f"    [{bp}] *** NaN DETECTED in {pname} "
+                             f"shape={list(pp.shape)} "
+                             f"norm={pp.float().norm().item()} "
+                             f"nan_count={pp.isnan().sum().item()}/{pp.numel()}")
+                    elif pp.isinf().any().item():
+                        tlog(f"    [{bp}] *** Inf DETECTED in {pname} "
+                             f"shape={list(pp.shape)}")
+                tlog(f"    [{bp}] NaN check done")
+
+        # Accumulate loss
         running_loss += loss.detach() * grad_accum
         n_batches += 1
 
-    return running_loss.item() / max(n_batches, 1)
+        if verbose:
+            t_total = time.time() - t_step_start
+            tlog(f"    [{bp}] TOTAL step={t_total:.3f}s")
+
+        t_data_start = time.time()
+
+    avg_loss = running_loss.item() / max(n_batches, 1)
+    tlog(f"    train_one_epoch: {n_batches} batches, avg_loss={avg_loss:.6f}")
+    return avg_loss
 
 
 @torch.no_grad()
-def eval_loss(model, loader, amp_ctx, device):
+def eval_loss(model, loader, amp_ctx, device, epoch=0):
     total_loss = 0.0
     n_batches = 0
-    for x, y in loader:
+    total = len(loader)
+
+    for step, (x, y) in enumerate(loader):
+        heartbeat(f"epoch {epoch}, eval batch {step+1}/{total}")
         x = x.to(device, non_blocking=True)
         y = y.to(device, non_blocking=True)
-        with amp_ctx:
-            _, loss = model(x, y)
+
+        try:
+            with amp_ctx:
+                _, loss = model(x, y)
+        except Exception as e:
+            tlog(f"    eval batch {step+1}: EXCEPTION: {e}")
+            traceback.print_exc()
+            raise
+
         total_loss += loss.item()
         n_batches += 1
-    return total_loss / max(n_batches, 1)
+
+        if step < 3 or step % 200 == 0 or step == total - 1:
+            tlog(f"    eval {step+1}/{total}: loss={loss.item():.4f}")
+
+    avg = total_loss / max(n_batches, 1)
+    tlog(f"    eval_loss: {n_batches} batches, avg={avg:.6f}")
+    return avg
 
 
 if __name__ == '__main__':
