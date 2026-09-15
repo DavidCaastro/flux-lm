@@ -59,6 +59,10 @@ def parse_args():
                    help='torch.compile the model')
     p.add_argument('--grad-checkpoint', action='store_true',
                    help='Gradient checkpointing per layer')
+    p.add_argument('--parallel', action='store_true',
+                   help='Parallel scan (mean-field) instead of sequential loop')
+    p.add_argument('--n-corrections', type=int, default=1,
+                   help='Perturbative correction depth for parallel mode')
     # Checkpointing
     p.add_argument('--ckpt', type=str, default=None)
     p.add_argument('--resume', action='store_true')
@@ -158,12 +162,20 @@ def main():
         log(f'Loaded Rust checkpoint {args.rust_ckpt} '
             f'(epoch {start_epoch}, loss={ckpt_info["loss"]:.4f})', rank)
     else:
-        model = FluxModel(d=args.d, n_layers=args.layers)
+        model = FluxModel(d=args.d, n_layers=args.layers,
+                          parallel=args.parallel,
+                          n_corrections=args.n_corrections)
 
     model = model.to(device)
     n_params = model.count_params()
+    mode = 'parallel' if args.parallel else 'sequential'
     log(f'Flux v3 [{args.dtype}]: d={model.d}, layers={model.n_layers}, '
-        f'params={n_params:,}', rank)
+        f'params={n_params:,}, mode={mode}', rank)
+    if args.parallel:
+        log(f'Parallel scan: n_corrections={args.n_corrections}', rank)
+        if args.resume or args.rust_ckpt:
+            raw_model = model
+            raw_model.set_mode(parallel=True, n_corrections=args.n_corrections)
 
     if args.grad_checkpoint:
         for layer in model.layers:
