@@ -367,28 +367,25 @@ class _ParallelScanFunction(torch.autograd.Function):
         yt = mod.parallel_scan_cuda(decay, xt)
         y = yt.reshape(B, D, T).transpose(1, 2).contiguous()
 
-        ctx.save_for_backward(decay)
+        ctx.save_for_backward(decay, y)
         ctx.shape = (B, T, D)
         return y
 
     @staticmethod
     def backward(ctx, grad_output):
-        decay, = ctx.saved_tensors
+        decay, y = ctx.saved_tensors
         B, T, D = ctx.shape
         mod = _get_module()
 
         # Reverse scan: flip time, scan, flip back
+        # This computes the adjoint λ[t] = grad_output[t] + decay · λ[t+1]
         grad_flip = grad_output.flip(1).transpose(1, 2).contiguous().reshape(B * D, T)
         grad_scan = mod.parallel_scan_cuda(decay, grad_flip)
         grad_x = grad_scan.reshape(B, D, T).transpose(1, 2).contiguous().flip(1)
 
-        # grad_decay: sum over batch and time of y[t-1] * grad_x_accum[t]
-        # This is complex; use PyTorch autograd for decay grad
-        # For now, decay is typically detached or we use a simpler formula
-        # grad_decay[d] = sum_t grad_output[t,d] * y[t-1,d]
-        # We don't have y saved, so we recompute
-        xt = grad_output.new_zeros(B, T, D)  # placeholder
-        grad_decay = None  # decay grads flow through the Python-level ops
+        # grad_decay[d] = Σ_{b,t} adjoint[b,t,d] · y[b,t-1,d]
+        y_prev = F.pad(y[:, :-1, :], (0, 0, 1, 0))
+        grad_decay = (grad_x * y_prev).sum(dim=(0, 1))
 
         return grad_decay, grad_x
 
