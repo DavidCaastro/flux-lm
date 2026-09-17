@@ -1,0 +1,13 @@
+# Corpus files (large, regenerable via scripts/)
+data/*.txt
+
+# CUDA kernel JIT caches
+.kernel_cache/
+.selective_scan_cache/
+
+# Python
+__pycache__/
+*.pyc
+
+# Checkpoints (large binary files)
+checkpoints/*.pt
