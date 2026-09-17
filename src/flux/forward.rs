@@ -51,6 +51,8 @@ pub struct FluxLayerOffsets {
     pub delta_slow: usize,
     pub b_in_slow: usize,
     pub c_out_slow: usize,
+    pub w_adapt_fast: usize,
+    pub w_adapt_slow: usize,
 }
 
 pub fn flux_layer_offsets(
@@ -71,13 +73,16 @@ pub fn flux_layer_offsets(
     let skip = o; o += d;
     let delta_slow = o; o += d;
     let b_in_slow = o; o += d;
-    let c_out_slow = o;
+    let c_out_slow = o; o += d;
+    let w_adapt_fast = o; o += d;
+    let w_adapt_slow = o;
     let _ = o;
     FluxLayerOffsets {
         rn, g_gate, a_bias, w_gate_h,
         s1, b1, s2, b2,
         delta_fast, b_in_fast, c_out_fast, skip,
         delta_slow, b_in_slow, c_out_slow,
+        w_adapt_fast, w_adapt_slow,
     }
 }
 
@@ -117,12 +122,6 @@ pub fn flux_forward_pass<F: Float>(
         let lf = flux_layer_offsets(lo, d);
         let spm_off = spm::spm_offsets(spm_base, d, li);
 
-        let lambdas_fast: Vec<F> = (0..d).map(|k| {
-            (-softplus(params[lf.delta_fast + k])).exp()
-        }).collect();
-        let lambdas_slow: Vec<F> = (0..d).map(|k| {
-            (-softplus(params[lf.delta_slow + k])).exp()
-        }).collect();
         let lambdas_sem: [F; K] = {
             let mut l = [F::ZERO; K];
             for i in 0..K {
@@ -169,9 +168,16 @@ pub fn flux_forward_pass<F: Float>(
             }
 
             for k in 0..d {
-                h_fast[k] = lambdas_fast[k] * h_fast[k]
+                let lf_arg = params[lf.delta_fast + k]
+                    + params[lf.w_adapt_fast + k] * state[k];
+                let lf_k = (-softplus(lf_arg)).exp();
+                h_fast[k] = lf_k * h_fast[k]
                     + params[lf.b_in_fast + k] * state[k];
-                h_slow[k] = lambdas_slow[k] * h_slow[k]
+
+                let ls_arg = params[lf.delta_slow + k]
+                    + params[lf.w_adapt_slow + k] * state[k];
+                let ls_k = (-softplus(ls_arg)).exp();
+                h_slow[k] = ls_k * h_slow[k]
                     + params[lf.b_in_slow + k] * state[k];
             }
 
@@ -275,12 +281,6 @@ pub fn flux_forward_inference<F: Float>(
         let lf = flux_layer_offsets(lo, d);
         let spm_off = spm::spm_offsets(spm_base, d, li);
 
-        let lambdas_fast: Vec<F> = (0..d).map(|k| {
-            (-softplus(params[lf.delta_fast + k])).exp()
-        }).collect();
-        let lambdas_slow: Vec<F> = (0..d).map(|k| {
-            (-softplus(params[lf.delta_slow + k])).exp()
-        }).collect();
         let lambdas_sem: [F; K] = {
             let mut l = [F::ZERO; K];
             for i in 0..K {
@@ -327,9 +327,16 @@ pub fn flux_forward_inference<F: Float>(
             }
 
             for k in 0..d {
-                h_fast[k] = lambdas_fast[k] * h_fast[k]
+                let lf_arg = params[lf.delta_fast + k]
+                    + params[lf.w_adapt_fast + k] * state[k];
+                let lf_k = (-softplus(lf_arg)).exp();
+                h_fast[k] = lf_k * h_fast[k]
                     + params[lf.b_in_fast + k] * state[k];
-                h_slow[k] = lambdas_slow[k] * h_slow[k]
+
+                let ls_arg = params[lf.delta_slow + k]
+                    + params[lf.w_adapt_slow + k] * state[k];
+                let ls_k = (-softplus(ls_arg)).exp();
+                h_slow[k] = ls_k * h_slow[k]
                     + params[lf.b_in_slow + k] * state[k];
             }
 

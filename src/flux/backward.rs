@@ -112,12 +112,6 @@ fn backward_flux_layer<F: Float>(
     let spm_base = flux_pre_spm_param_count(d, n_layers);
     let spm_off = spm::spm_offsets(spm_base, d, li);
 
-    let lambdas_fast: Vec<F> = (0..d).map(|k| {
-        (-softplus(params[lf.delta_fast + k])).exp()
-    }).collect();
-    let lambdas_slow: Vec<F> = (0..d).map(|k| {
-        (-softplus(params[lf.delta_slow + k])).exp()
-    }).collect();
     let lambdas_sem: [F; K] = {
         let mut l = [F::ZERO; K];
         for i in 0..K {
@@ -136,11 +130,11 @@ fn backward_flux_layer<F: Float>(
     let (states_after_rn,
          states_after_wht1, states_after_tanh1,
          states_after_wht2, states_after_tanh2,
-         h_fast_hist, h_slow_hist) = recompute_layer_internals(
-        &bytes, params, d, &lf,
-        &lambdas_fast, &lambdas_slow, seq_len,
-        layer_inputs,
-    );
+         h_fast_hist, h_slow_hist,
+         lambdas_fast_hist, lambdas_slow_hist) =
+        recompute_layer_internals(
+            &bytes, params, d, &lf, seq_len, layer_inputs,
+        );
 
     let (h_sem_hist, z_hist) = recompute_spm_state(
         params, d, &spm_off, &lambdas_sem, &h_slow_hist, seq_len,
@@ -251,11 +245,20 @@ fn backward_flux_layer<F: Float>(
 
             let h_fast_prev =
                 if t > 0 { h_fast_hist[t - 1][k] } else { F::ZERO };
-            let sp_sig_fast =
-                sigmoid(params[lf.delta_fast + k]);
+            let lf_arg = params[lf.delta_fast + k]
+                + params[lf.w_adapt_fast + k]
+                * states_after_tanh2[t][k];
+            let sp_sig_fast = sigmoid(lf_arg);
+            let lam_f = lambdas_fast_hist[t][k];
+            let common_f = dl_dh_fast_cur
+                * h_fast_prev * (-lam_f) * sp_sig_fast;
             grads[lf.delta_fast + k] = grads[lf.delta_fast + k]
-                + dl_dh_fast_cur
-                * h_fast_prev * (-lambdas_fast[k]) * sp_sig_fast;
+                + common_f;
+            grads[lf.w_adapt_fast + k] =
+                grads[lf.w_adapt_fast + k]
+                + common_f * states_after_tanh2[t][k];
+            dl_dstate[k] = dl_dstate[k]
+                + common_f * params[lf.w_adapt_fast + k];
 
             grads[lf.b_in_slow + k] = grads[lf.b_in_slow + k]
                 + dl_dh_slow_cur * states_after_tanh2[t][k];
@@ -264,14 +267,23 @@ fn backward_flux_layer<F: Float>(
 
             let h_slow_prev =
                 if t > 0 { h_slow_hist[t - 1][k] } else { F::ZERO };
-            let sp_sig_slow =
-                sigmoid(params[lf.delta_slow + k]);
+            let ls_arg = params[lf.delta_slow + k]
+                + params[lf.w_adapt_slow + k]
+                * states_after_tanh2[t][k];
+            let sp_sig_slow = sigmoid(ls_arg);
+            let lam_s = lambdas_slow_hist[t][k];
+            let common_s = dl_dh_slow_cur
+                * h_slow_prev * (-lam_s) * sp_sig_slow;
             grads[lf.delta_slow + k] = grads[lf.delta_slow + k]
-                + dl_dh_slow_cur
-                * h_slow_prev * (-lambdas_slow[k]) * sp_sig_slow;
+                + common_s;
+            grads[lf.w_adapt_slow + k] =
+                grads[lf.w_adapt_slow + k]
+                + common_s * states_after_tanh2[t][k];
+            dl_dstate[k] = dl_dstate[k]
+                + common_s * params[lf.w_adapt_slow + k];
 
-            dh_fast[k] = dl_dh_fast_cur * lambdas_fast[k];
-            dh_slow[k] = dl_dh_slow_cur * lambdas_slow[k];
+            dh_fast[k] = dl_dh_fast_cur * lam_f;
+            dh_slow[k] = dl_dh_slow_cur * lam_s;
         }
 
         for k in 0..d {
@@ -407,9 +419,9 @@ fn rmsnorm_apply<F: Float>(x: &mut [F], gamma: &[F], d: usize) {
 fn recompute_layer_internals<F: Float>(
     bytes: &[u8], params: &[F], d: usize,
     lf: &FluxLayerOffsets,
-    lambdas_fast: &[F], lambdas_slow: &[F],
     seq_len: usize, inputs: &[Vec<F>],
 ) -> (Vec<Vec<F>>, Vec<Vec<F>>, Vec<Vec<F>>,
+      Vec<Vec<F>>, Vec<Vec<F>>,
       Vec<Vec<F>>, Vec<Vec<F>>,
       Vec<Vec<F>>, Vec<Vec<F>>) {
     let mut after_rn = Vec::with_capacity(seq_len);
@@ -419,6 +431,8 @@ fn recompute_layer_internals<F: Float>(
     let mut after_tanh2 = Vec::with_capacity(seq_len);
     let mut h_fast_hist = Vec::with_capacity(seq_len);
     let mut h_slow_hist = Vec::with_capacity(seq_len);
+    let mut lam_fast_hist = Vec::with_capacity(seq_len);
+    let mut lam_slow_hist = Vec::with_capacity(seq_len);
 
     let mut h_fast = vec![F::ZERO; d];
     let mut h_slow = vec![F::ZERO; d];
@@ -458,17 +472,31 @@ fn recompute_layer_internals<F: Float>(
         }
         after_tanh2.push(state.clone());
 
+        let mut lf_vec = vec![F::ZERO; d];
+        let mut ls_vec = vec![F::ZERO; d];
         for k in 0..d {
-            h_fast[k] = lambdas_fast[k] * h_fast[k]
+            let lf_arg = params[lf.delta_fast + k]
+                + params[lf.w_adapt_fast + k] * state[k];
+            let lf_k = (-softplus(lf_arg)).exp();
+            lf_vec[k] = lf_k;
+            h_fast[k] = lf_k * h_fast[k]
                 + params[lf.b_in_fast + k] * state[k];
-            h_slow[k] = lambdas_slow[k] * h_slow[k]
+
+            let ls_arg = params[lf.delta_slow + k]
+                + params[lf.w_adapt_slow + k] * state[k];
+            let ls_k = (-softplus(ls_arg)).exp();
+            ls_vec[k] = ls_k;
+            h_slow[k] = ls_k * h_slow[k]
                 + params[lf.b_in_slow + k] * state[k];
         }
+        lam_fast_hist.push(lf_vec);
+        lam_slow_hist.push(ls_vec);
         h_fast_hist.push(h_fast.clone());
         h_slow_hist.push(h_slow.clone());
     }
 
     (after_rn, after_wht1, after_tanh1,
      after_wht2, after_tanh2,
-     h_fast_hist, h_slow_hist)
+     h_fast_hist, h_slow_hist,
+     lam_fast_hist, lam_slow_hist)
 }
