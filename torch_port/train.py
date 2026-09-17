@@ -22,7 +22,7 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data.distributed import DistributedSampler
 
 from flux.model import FluxModel, reset_debug_counters
-from flux.optim import EntropicAdam, WarmRestartCosineSchedule
+from flux.optim import EntropicAdam, CosineSchedule, WarmRestartCosineSchedule
 from flux.data import ByteCorpusDataset, load_corpus
 from flux.checkpoint import save_pytorch, load_pytorch, load_rust_checkpoint
 
@@ -117,6 +117,7 @@ def parse_args():
     p.add_argument('--wandb-project', type=str, default='flux-lm')
     p.add_argument('--print-every', type=int, default=5)
     p.add_argument('--num-workers', type=int, default=2)
+    p.add_argument('--schedule', choices=['cosine', 'sgdr'], default='cosine')
     p.add_argument('--early-stop-bpb', type=float, default=None,
                    help='Stop training when test_bpb drops below this value')
     return p.parse_args()
@@ -331,11 +332,15 @@ def main():
 
     # ── Optimizer ──
     heartbeat("main: creating optimizer")
-    tlog("Creando EntropicAdam + WarmRestartCosineSchedule...")
+    if args.schedule == 'sgdr':
+        schedule = WarmRestartCosineSchedule(
+            total_epochs=args.epochs, start_epoch=start_epoch)
+    else:
+        schedule = CosineSchedule(
+            total_epochs=args.epochs, start_epoch=start_epoch)
+    tlog(f"Creando EntropicAdam + {type(schedule).__name__}...")
     optimizer = EntropicAdam(
         raw_model.parameters(), lr=args.lr, total_epochs=args.epochs)
-    schedule = WarmRestartCosineSchedule(
-        total_epochs=args.epochs, start_epoch=0)
     tlog("Optimizer y schedule creados")
 
     # Restore optimizer state if resuming from checkpoint

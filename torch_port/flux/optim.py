@@ -160,6 +160,25 @@ class EntropicAdam(Optimizer):
         return loss
 
 
+class CosineSchedule:
+    """Simple cosine annealing from 1 to 0 over [start_epoch, end_epoch]."""
+
+    def __init__(self, total_epochs: int, start_epoch: int = 0,
+                 warmup_frac: float = 0.05):
+        self.total_epochs = total_epochs
+        self.start_epoch = start_epoch
+        self.warmup_frac = warmup_frac
+
+    def get_factor(self, epoch: int) -> float:
+        warmup_epochs = max(self.warmup_frac * self.total_epochs, 1)
+        warmup = min(epoch / warmup_epochs, 1.0)
+        e = max(epoch - self.start_epoch, 0)
+        span = max(self.total_epochs - self.start_epoch, 1)
+        progress = min(e / span, 1.0)
+        cosine = 0.5 * (1.0 + math.cos(math.pi * progress))
+        return warmup * cosine
+
+
 class WarmRestartCosineSchedule:
     """Warm-restart cosine annealing with exponential period doubling."""
 
