@@ -1,7 +1,6 @@
 #!/usr/bin/env python3
-"""Flux v3 training — INSTRUMENTED: ultra-verbose logging + watchdog timeout.
+"""Flux v3 training with early stopping support.
 
-Every operation logs BEFORE it starts so the last log line reveals where a hang occurs.
 Watchdog thread kills the process if no heartbeat for 180s.
 """
 
@@ -118,6 +117,8 @@ def parse_args():
     p.add_argument('--wandb-project', type=str, default='flux-lm')
     p.add_argument('--print-every', type=int, default=5)
     p.add_argument('--num-workers', type=int, default=2)
+    p.add_argument('--early-stop-bpb', type=float, default=None,
+                   help='Stop training when test_bpb drops below this value')
     return p.parse_args()
 
 
@@ -441,6 +442,17 @@ def main():
         heartbeat(f"epoch {epoch}: done")
         tlog(f"  EPOCH {epoch} COMPLETADA en {epoch_s:.1f}s, VRAM={vram()}")
 
+        # ── Early stopping ──
+        if args.early_stop_bpb is not None and test_bpb is not None:
+            if test_bpb < args.early_stop_bpb:
+                tlog(f"  EARLY STOP: test_bpb={test_bpb:.4f} < {args.early_stop_bpb}")
+                if is_master:
+                    ckpt_path = os.path.join(
+                        args.ckpt_dir, f'flux_early_stop_epoch_{epoch:04d}.pt')
+                    save_pytorch(raw_model, optimizer, epoch, train_loss, ckpt_path)
+                    tlog(f'  Checkpoint early-stop guardado: {ckpt_path}')
+                break
+
     # ── Cleanup ──
     if ddp:
         torch.distributed.destroy_process_group()
@@ -465,8 +477,8 @@ def train_one_epoch(model, loader, optimizer, scaler, amp_ctx,
         t_step_start = time.time()
         heartbeat(f"epoch {epoch}, batch {step+1}/{total_batches}")
 
-        # Verbose only first 2, every 5000th, and last batch
-        verbose = (step < 2) or (step % 5000 == 0) or (step == total_batches - 1)
+        # Verbose: first batch, every 2000th, and last batch
+        verbose = (step == 0) or (step % 2000 == 0) or (step == total_batches - 1)
 
         bp = f"E{epoch} B{step+1}/{total_batches}"
 

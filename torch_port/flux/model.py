@@ -16,6 +16,11 @@ try:
 except (ImportError, RuntimeError):
     HAS_FUSED_KERNELS = False
 
+try:
+    from .selective_scan_kernel import variable_parallel_scan_fused, HAS_SELECTIVE_SCAN_KERNEL
+except (ImportError, RuntimeError):
+    HAS_SELECTIVE_SCAN_KERNEL = False
+
 K = 4       # Semantic partition features
 STRIDE = 4  # SPM update stride
 _MAX_FUSED_DIM = 1024  # CUDA max threads per block
@@ -76,18 +81,38 @@ def wht(x: torch.Tensor) -> torch.Tensor:
 
 
 def parallel_scan(decay: torch.Tensor, x: torch.Tensor) -> torch.Tensor:
-    """Parallel linear recurrence: y[t] = decay * y[t-1] + x[t]."""
-    y = x
-    stride = 1
-    decay_pow = decay.view(1, 1, -1)
+    """Parallel linear recurrence: y[t] = decay[t] * y[t-1] + x[t].
 
-    while stride < y.shape[1]:
-        y_shifted = F.pad(y[:, :-stride, :], (0, 0, stride, 0)) * decay_pow
-        y = y + y_shifted
-        decay_pow = decay_pow * decay_pow
-        stride *= 2
-
-    return y
+    decay: (d,) for constant decay, or (B, T, d) for variable per-timestep decay.
+    x: (B, T, d)
+    """
+    if decay.dim() == 1:
+        # Constant decay — original Hillis-Steele with squared powers
+        y = x
+        stride = 1
+        decay_pow = decay.view(1, 1, -1)
+        while stride < y.shape[1]:
+            y_shifted = F.pad(y[:, :-stride, :], (0, 0, stride, 0)) * decay_pow
+            y = y + y_shifted
+            decay_pow = decay_pow * decay_pow
+            stride *= 2
+        return y
+    else:
+        # Variable decay — use fused CUDA kernel if available
+        if HAS_SELECTIVE_SCAN_KERNEL and x.is_cuda and x.shape[1] <= 1024:
+            return variable_parallel_scan_fused(decay, x)
+        # Fallback: PyTorch general associative scan
+        # Operator: (a1,b1) ⊕ (a2,b2) = (a2*a1, a2*b1 + b2)
+        a = decay
+        b = x
+        stride = 1
+        while stride < b.shape[1]:
+            a_prev = F.pad(a[:, :-stride, :], (0, 0, stride, 0), value=1.0)
+            b_prev = F.pad(b[:, :-stride, :], (0, 0, stride, 0))
+            b = a * b_prev + b
+            a = a * a_prev
+            stride *= 2
+        return b
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -117,10 +142,12 @@ class FluxLayer(nn.Module):
         self.s2 = nn.Parameter(torch.ones(d))
         self.b2 = nn.Parameter(torch.zeros(d))
         self.delta_fast = nn.Parameter(torch.empty(d))
+        self.delta_fast_mod = nn.Parameter(torch.zeros(d))  # content-dependent decay modulation
         self.b_in_fast = nn.Parameter(torch.ones(d))
         self.c_out_fast = nn.Parameter(torch.empty(d))
         self.skip = nn.Parameter(torch.full((d,), 0.5))
         self.delta_slow = nn.Parameter(torch.empty(d))
+        self.delta_slow_mod = nn.Parameter(torch.zeros(d))  # content-dependent decay modulation
         self.b_in_slow = nn.Parameter(torch.ones(d))
         self.c_out_slow = nn.Parameter(torch.empty(d))
         self.spm_delta = nn.Parameter(torch.empty(K))
@@ -157,8 +184,6 @@ class FluxLayer(nn.Module):
     def _forward_sequential(self, x: torch.Tensor, byte_ids: torch.Tensor,
                             spm_w: torch.Tensor) -> torch.Tensor:
         B, T, d = x.shape
-        lam_fast = torch.exp(-F.softplus(self.delta_fast))
-        lam_slow = torch.exp(-F.softplus(self.delta_slow))
         lam_sem = torch.exp(-F.softplus(self.spm_delta))
         gate_sig = torch.sigmoid(self.spm_gate)
         h_fast = x.new_zeros(B, d)
@@ -176,6 +201,9 @@ class FluxLayer(nn.Module):
             state = gate * state + self.a_bias(bi)
             state = torch.tanh(self.s1 * wht(state) + self.b1)
             state = torch.tanh(self.s2 * wht(state) + self.b2)
+            # Content-dependent decay
+            lam_fast = torch.exp(-F.softplus(self.delta_fast + state * self.delta_fast_mod))
+            lam_slow = torch.exp(-F.softplus(self.delta_slow + state * self.delta_slow_mod))
             h_fast = lam_fast * h_fast + self.b_in_fast * state
             h_slow = lam_slow * h_slow + self.b_in_slow * state
             if t % STRIDE == 0:
@@ -204,18 +232,14 @@ class FluxLayer(nn.Module):
                   f"fused={self.use_fused} n_corr={self.n_corrections}")
             _tlog(f"      L{li}: {_tstat('x_in', x)}")
 
-        # ── Decay lambdas ──
+        # ── Decay lambdas (SPM only — fast/slow are now content-dependent) ──
         if verbose:
-            _tlog(f"      L{li}: computing decay lambdas...")
+            _tlog(f"      L{li}: computing decay lambdas (SPM)...")
         t0 = time.time()
-        lam_fast = torch.exp(-F.softplus(self.delta_fast))
-        lam_slow = torch.exp(-F.softplus(self.delta_slow))
         lam_sem = torch.exp(-F.softplus(self.spm_delta))
         gate_sig = torch.sigmoid(self.spm_gate)
         if verbose:
             _tlog(f"      L{li}: lambdas OK ({time.time()-t0:.4f}s)")
-            _tlog(f"      L{li}: {_tstat('lam_fast', lam_fast)}")
-            _tlog(f"      L{li}: {_tstat('lam_slow', lam_slow)}")
             _tlog(f"      L{li}: {_tstat('lam_sem', lam_sem)}")
             _tlog(f"      L{li}: {_tstat('gate_sig', gate_sig)}")
 
@@ -306,42 +330,36 @@ class FluxLayer(nn.Module):
                     _tlog(f"      L{li}: WHT#2 pytorch OK ({time.time()-t0:.4f}s)")
                     _tlog(f"      L{li}: {_tstat('state_post_wht2', state)}")
 
-            # Parallel scan: h_fast
-            if self.use_fused and state.is_cuda:
-                if verbose:
-                    _tlog(f"      L{li}: parallel_scan_fused h_fast "
-                          f"(input.shape={list(state.shape)})...")
-                t0 = time.time()
-                h_fast = parallel_scan_fused(lam_fast, self.b_in_fast * state)
-                if verbose:
-                    _tlog(f"      L{li}: scan h_fast OK ({time.time()-t0:.4f}s)")
-                    _tlog(f"      L{li}: {_tstat('h_fast', h_fast)}")
-            else:
-                if verbose:
-                    _tlog(f"      L{li}: PyTorch scan h_fast...")
-                t0 = time.time()
-                h_fast = parallel_scan(lam_fast, self.b_in_fast * state)
-                if verbose:
-                    _tlog(f"      L{li}: scan h_fast OK ({time.time()-t0:.4f}s)")
-                    _tlog(f"      L{li}: {_tstat('h_fast', h_fast)}")
+            # Content-dependent decay (selective scan)
+            if verbose:
+                _tlog(f"      L{li}: computing content-dependent decay...")
+            t0 = time.time()
+            delta_fast_t = self.delta_fast + state * self.delta_fast_mod
+            lam_fast_t = torch.exp(-F.softplus(delta_fast_t))
+            delta_slow_t = self.delta_slow + state * self.delta_slow_mod
+            lam_slow_t = torch.exp(-F.softplus(delta_slow_t))
+            if verbose:
+                _tlog(f"      L{li}: decay OK ({time.time()-t0:.4f}s)")
+                _tlog(f"      L{li}: {_tstat('lam_fast_t', lam_fast_t)}")
+                _tlog(f"      L{li}: {_tstat('lam_slow_t', lam_slow_t)}")
 
-            # Parallel scan: h_slow
-            if self.use_fused and state.is_cuda:
-                if verbose:
-                    _tlog(f"      L{li}: parallel_scan_fused h_slow...")
-                t0 = time.time()
-                h_slow = parallel_scan_fused(lam_slow, self.b_in_slow * state)
-                if verbose:
-                    _tlog(f"      L{li}: scan h_slow OK ({time.time()-t0:.4f}s)")
-                    _tlog(f"      L{li}: {_tstat('h_slow', h_slow)}")
-            else:
-                if verbose:
-                    _tlog(f"      L{li}: PyTorch scan h_slow...")
-                t0 = time.time()
-                h_slow = parallel_scan(lam_slow, self.b_in_slow * state)
-                if verbose:
-                    _tlog(f"      L{li}: scan h_slow OK ({time.time()-t0:.4f}s)")
-                    _tlog(f"      L{li}: {_tstat('h_slow', h_slow)}")
+            # Parallel scan: h_fast (variable decay)
+            if verbose:
+                _tlog(f"      L{li}: parallel_scan h_fast (variable decay)...")
+            t0 = time.time()
+            h_fast = parallel_scan(lam_fast_t, self.b_in_fast * state)
+            if verbose:
+                _tlog(f"      L{li}: scan h_fast OK ({time.time()-t0:.4f}s)")
+                _tlog(f"      L{li}: {_tstat('h_fast', h_fast)}")
+
+            # Parallel scan: h_slow (variable decay)
+            if verbose:
+                _tlog(f"      L{li}: parallel_scan h_slow (variable decay)...")
+            t0 = time.time()
+            h_slow = parallel_scan(lam_slow_t, self.b_in_slow * state)
+            if verbose:
+                _tlog(f"      L{li}: scan h_slow OK ({time.time()-t0:.4f}s)")
+                _tlog(f"      L{li}: {_tstat('h_slow', h_slow)}")
 
         # ── SPM ──
         if verbose:

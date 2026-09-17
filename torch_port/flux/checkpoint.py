@@ -28,7 +28,11 @@ def save_pytorch(model: FluxModel, optimizer, epoch: int, loss: float,
 def load_pytorch(path: str, device='cpu'):
     ckpt = torch.load(path, map_location=device, weights_only=False)
     model = FluxModel(d=ckpt['d'], n_layers=ckpt['n_layers'])
-    model.load_state_dict(ckpt['model_state'])
+    result = model.load_state_dict(ckpt['model_state'], strict=False)
+    if result.missing_keys:
+        print(f"  [checkpoint] New params (init from scratch): {result.missing_keys}")
+    if result.unexpected_keys:
+        print(f"  [checkpoint] Unexpected keys (ignored): {result.unexpected_keys}")
     return model, ckpt
 
 
