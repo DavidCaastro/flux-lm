@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Build a ~50-80MB Python code corpus from popular GitHub repos.
+"""Build a Python code corpus from popular GitHub repos.
 
 Downloads top Python repos as zip archives, extracts .py files,
 filters out junk (tests, configs, generated), and concatenates
@@ -7,6 +7,7 @@ into a single UTF-8 text file.
 
 Usage:
     python3 scripts/build_code_corpus.py --output data/corpus_python.txt --target-mb 60
+    python3 scripts/build_code_corpus.py --output data/corpus_python_1gb.txt --target-mb 1024
 """
 
 import argparse
@@ -16,40 +17,153 @@ import zipfile
 import urllib.request
 import time
 
-# Repos: popular, diverse, high-quality Python code
+# Large, high-quality Python repos organized by category.
+# Ordered roughly by code volume to reach target faster.
 REPOS = [
-    # Web frameworks
-    ("django/django", "main"),
-    ("pallets/flask", "main"),
-    ("fastapi/fastapi", "master"),
-    ("encode/starlette", "master"),
-    ("encode/httpx", "master"),
-    ("huge-success/sanic", "main"),
-    # ML / Data (medium-sized repos, NOT pytorch/cpython)
+    # === Large codebases (10-50+ MB of .py each) ===
+    ("python/cpython", "main"),
+    ("pytorch/pytorch", "main"),
+    ("tensorflow/tensorflow", "master"),
     ("scikit-learn/scikit-learn", "main"),
     ("pandas-dev/pandas", "main"),
     ("numpy/numpy", "main"),
+    ("matplotlib/matplotlib", "main"),
+    ("scipy/scipy", "main"),
+    ("sympy/sympy", "master"),
     ("huggingface/transformers", "main"),
-    # Utilities
-    ("psf/requests", "main"),
-    ("aio-libs/aiohttp", "master"),
-    ("pydantic/pydantic", "main"),
-    ("python-attrs/attrs", "main"),
-    ("more-itertools/more-itertools", "master"),
-    # CLI / DevOps
-    ("pallets/click", "main"),
+    ("ansible/ansible", "devel"),
+    ("saltstack/salt", "master"),
+    ("odoo/odoo", "master"),
+    ("home-assistant/core", "dev"),
+
+    # === Web frameworks ===
+    ("django/django", "main"),
+    ("pallets/flask", "main"),
+    ("fastapi/fastapi", "master"),
+    ("tornadoweb/tornado", "master"),
+    ("encode/starlette", "master"),
+    ("huge-success/sanic", "main"),
+    ("bottlepy/bottle", "master"),
+    ("falconry/falcon", "master"),
+    ("channelcat/sanic", "main"),
+
+    # === ML / AI ===
+    ("keras-team/keras", "master"),
+    ("openai/gym", "master"),
+    ("ray-project/ray", "master"),
+    ("apache/airflow", "main"),
+    ("mlflow/mlflow", "master"),
+    ("dmlc/xgboost", "master"),
+    ("Lightning-AI/pytorch-lightning", "master"),
+    ("huggingface/diffusers", "main"),
+    ("huggingface/datasets", "main"),
+    ("langchain-ai/langchain", "master"),
+    ("vllm-project/vllm", "main"),
+    ("openai/whisper", "main"),
+
+    # === Data / DB ===
+    ("apache/spark", "master"),
+    ("great-expectations/great_expectations", "develop"),
+    ("dagster-io/dagster", "master"),
+    ("prefecthq/prefect", "main"),
+    ("dbt-labs/dbt-core", "main"),
+    ("sqlalchemy/sqlalchemy", "main"),
+    ("coleifer/peewee", "master"),
+    ("tortoise/tortoise-orm", "develop"),
+
+    # === DevOps / CLI ===
+    ("docker/compose", "main"),
     ("python-poetry/poetry", "main"),
     ("pypa/pip", "main"),
+    ("pallets/click", "main"),
+    ("tqdm/tqdm", "master"),
+    ("psf/black", "main"),
+    ("PyCQA/pylint", "main"),
+    ("PyCQA/flake8", "main"),
+    ("astral-sh/ruff", "main"),
     ("pre-commit/pre-commit", "main"),
-    # Async / networking
+    ("pypa/setuptools", "main"),
+    ("pypa/virtualenv", "main"),
+
+    # === Networking / HTTP ===
+    ("psf/requests", "main"),
+    ("aio-libs/aiohttp", "master"),
+    ("encode/httpx", "master"),
+    ("urllib3/urllib3", "main"),
+    ("scrapy/scrapy", "master"),
     ("MagicStack/uvloop", "master"),
     ("encode/uvicorn", "master"),
     ("celery/celery", "main"),
-    # Data / parsing
-    ("yaml/pyyaml", "main"),
+    ("benoitc/gunicorn", "master"),
+    ("gevent/gevent", "master"),
+    ("twisted/twisted", "trunk"),
+
+    # === Security / Crypto ===
+    ("pyca/cryptography", "main"),
+    ("paramiko/paramiko", "main"),
+    ("mitmproxy/mitmproxy", "main"),
+    ("certbot/certbot", "master"),
+
+    # === Data science / Viz ===
+    ("bokeh/bokeh", "branch-3.7"),
+    ("plotly/plotly.py", "master"),
+    ("streamlit/streamlit", "develop"),
+    ("gradio-app/gradio", "main"),
+    ("Textualize/rich", "master"),
+    ("Textualize/textual", "main"),
+
+    # === Utilities ===
+    ("pydantic/pydantic", "main"),
+    ("python-attrs/attrs", "main"),
+    ("more-itertools/more-itertools", "master"),
+    ("pytoolz/toolz", "master"),
+    ("jazzband/tablib", "master"),
+    ("arrow-py/arrow", "master"),
+    ("dateutil/dateutil", "master"),
     ("simplejson/simplejson", "master"),
-    ("jmespath/jmespath.py", "develop"),
+    ("yaml/pyyaml", "main"),
+    ("msgpack/msgpack-python", "main"),
+
+    # === Testing ===
+    ("pytest-dev/pytest", "main"),
+    ("HypothesisWorks/hypothesis", "master"),
+    ("robotframework/robotframework", "master"),
+    ("locustio/locust", "master"),
+
+    # === AWS / Cloud ===
     ("boto/boto3", "develop"),
+    ("aws/aws-cli", "v2"),
+    ("localstack/localstack", "master"),
+    ("pulumi/pulumi", "master"),
+
+    # === NLP / Text ===
+    ("nltk/nltk", "develop"),
+    ("explosion/spaCy", "master"),
+    ("RasaHQ/rasa", "main"),
+    ("flairNLP/flair", "master"),
+    ("stanfordnlp/stanza", "main"),
+
+    # === Image / CV ===
+    ("python-pillow/Pillow", "main"),
+    ("opencv/opencv-python", "4.x"),
+    ("ultralytics/ultralytics", "main"),
+    ("facebookresearch/detectron2", "main"),
+
+    # === Misc large projects ===
+    ("pallets/werkzeug", "main"),
+    ("pallets/jinja", "main"),
+    ("pallets/markupsafe", "main"),
+    ("mwaskom/seaborn", "master"),
+    ("networkx/networkx", "main"),
+    ("giampaolo/psutil", "master"),
+    ("docker/docker-py", "main"),
+    ("fabric/fabric", "main"),
+    ("pyinstaller/pyinstaller", "develop"),
+    ("sphinx-doc/sphinx", "master"),
+    ("readthedocs/readthedocs.org", "main"),
+    ("jupyter/notebook", "main"),
+    ("ipython/ipython", "main"),
+    ("jupyterlab/jupyterlab", "main"),
 ]
 
 SKIP_DIRS = {
@@ -67,12 +181,12 @@ SKIP_SUFFIXES = (
 )
 
 MIN_FILE_BYTES = 200
-MAX_FILE_BYTES = 100_000  # skip huge generated files
+MAX_FILE_BYTES = 200_000
 
 
 def should_skip_path(path: str) -> bool:
     parts = path.lower().split("/")
-    for part in parts[:-1]:  # directories
+    for part in parts[:-1]:
         if any(skip in part for skip in SKIP_DIRS):
             return True
     fname = parts[-1]
@@ -88,7 +202,7 @@ def download_repo(owner_repo: str, branch: str) -> bytes | None:
     print(f"  Descargando {owner_repo} ({branch})...", end=" ", flush=True)
     try:
         req = urllib.request.Request(url, headers={"User-Agent": "flux-lm-corpus-builder"})
-        with urllib.request.urlopen(req, timeout=120) as resp:
+        with urllib.request.urlopen(req, timeout=180) as resp:
             data = resp.read()
         print(f"{len(data)/1024/1024:.1f} MB")
         return data
@@ -113,7 +227,6 @@ def extract_python_files(zip_data: bytes, target_mb: float, current_size: int) -
                     continue
                 try:
                     content = zf.read(info.filename).decode("utf-8", errors="ignore")
-                    # Basic quality filter: must have at least some code
                     if "def " not in content and "class " not in content:
                         continue
                     files.append(content)
@@ -142,7 +255,6 @@ def main():
 
     os.makedirs(os.path.dirname(args.output) or ".", exist_ok=True)
 
-    # Write incrementally to avoid memory issues and survive disconnects
     with open(args.output, "w", encoding="utf-8") as out:
         for owner_repo, branch in REPOS:
             if total_bytes >= target_bytes:
@@ -164,8 +276,9 @@ def main():
                     break
             out.flush()
 
-            print(f"    → {len(files)} archivos, total acumulado: {total_bytes/1024/1024:.1f} MB")
-            del zip_data, files  # free memory
+            print(f"    → {len(files)} archivos, total acumulado: "
+                  f"{total_bytes/1024/1024:.1f} MB")
+            del zip_data, files
             time.sleep(1)
 
     final_size = os.path.getsize(args.output)
