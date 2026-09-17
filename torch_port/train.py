@@ -271,6 +271,7 @@ def main():
     heartbeat("main: creating model")
     tlog("Creando modelo...")
     start_epoch = 0
+    ckpt_info = None
     if args.resume and args.ckpt and os.path.exists(args.ckpt):
         model, ckpt_info = load_pytorch(args.ckpt, device='cpu')
         start_epoch = ckpt_info['epoch']
@@ -334,8 +335,42 @@ def main():
     optimizer = EntropicAdam(
         raw_model.parameters(), lr=args.lr, total_epochs=args.epochs)
     schedule = WarmRestartCosineSchedule(
-        total_epochs=args.epochs, start_epoch=start_epoch)
+        total_epochs=args.epochs, start_epoch=0)
     tlog("Optimizer y schedule creados")
+
+    # Restore optimizer state if resuming from checkpoint
+    if ckpt_info is not None and 'optimizer_state' in ckpt_info:
+        try:
+            # Preserve sign_history (int64) before load_state_dict may corrupt it.
+            # PyTorch casts state tensors to param dtype (float32), which loses
+            # precision for int64 values > 2^24, corrupting bitwise operations.
+            raw_opt_state = ckpt_info['optimizer_state'].get('state', {})
+            sign_hist_backup = {}
+            for pid, pstate in raw_opt_state.items():
+                if 'sign_history' in pstate and isinstance(pstate['sign_history'], torch.Tensor):
+                    sign_hist_backup[int(pid)] = pstate['sign_history'].clone()
+
+            optimizer.load_state_dict(ckpt_info['optimizer_state'])
+
+            # Move all state tensors to correct device
+            for state in optimizer.state.values():
+                for k, v in state.items():
+                    if isinstance(v, torch.Tensor):
+                        state[k] = v.to(device)
+
+            # Restore original int64 sign_history (bypass float32 corruption)
+            if sign_hist_backup:
+                all_params = [p for g in optimizer.param_groups for p in g['params']]
+                for pid, sh in sign_hist_backup.items():
+                    if pid < len(all_params):
+                        param = all_params[pid]
+                        if param in optimizer.state:
+                            optimizer.state[param]['sign_history'] = sh.to(device=device)
+                tlog(f"  sign_history restaurado: {len(sign_hist_backup)} params (int64 preservado)")
+
+            tlog("Optimizer state restaurado desde checkpoint")
+        except Exception as e:
+            tlog(f"WARNING: No se pudo restaurar optimizer state: {e}")
 
     # ── WandB ──
     if args.wandb and is_master:
@@ -373,7 +408,8 @@ def main():
         lr_scale = schedule.get_factor(epoch)
         for pg in optimizer.param_groups:
             pg['lr'] = args.lr * lr_scale
-        tlog(f"  lr_scale={lr_scale:.6f}, lr_eff={args.lr * lr_scale:.6e}")
+        wd_eff = args.weight_decay * lr_scale
+        tlog(f"  lr_scale={lr_scale:.6f}, lr_eff={args.lr * lr_scale:.6e}, wd_eff={wd_eff:.6e}")
 
         # ── Train ──
         heartbeat(f"epoch {epoch}: train start")
@@ -382,7 +418,7 @@ def main():
         train_loss = train_one_epoch(
             model, train_loader, optimizer, scaler, amp_ctx,
             device, args.grad_accum, args.max_grad_norm,
-            args.weight_decay, epoch,
+            args.weight_decay * lr_scale, epoch,
         )
         heartbeat(f"epoch {epoch}: train done")
         tlog(f"  TRAIN OK: loss={train_loss:.6f}, VRAM={vram()}")

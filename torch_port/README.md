@@ -81,13 +81,20 @@ python generate_cli.py --rust-ckpt ../model.bin --seed-text "Hello" --length 500
 ```
 torch_port/
 ├── flux/
-│   ├── model.py        # FluxModel, FluxLayer, WHT
-│   ├── optim.py        # EntropicAdam + WarmRestartCosineSchedule
-│   ├── data.py         # ByteCorpusDataset
-│   ├── generate.py     # Autoregressive generation
-│   └── checkpoint.py   # Save/load + Rust format interop
-├── train.py            # Training script (DDP, AMP, wandb)
-├── generate_cli.py     # Generation CLI
-├── Dockerfile          # GPU cloud container
+│   ├── model.py                  # FluxModel, FluxLayer, WHT, selective scan
+│   ├── kernels.py                # CUDA JIT: WHT butterfly + constant-decay scan
+│   ├── selective_scan_kernel.py  # CUDA JIT: variable-decay selective scan (7.27x)
+│   ├── optim.py                  # EntropicAdam + WarmRestartCosineSchedule
+│   ├── data.py                   # ByteCorpusDataset
+│   ├── generate.py               # Autoregressive generation
+│   └── checkpoint.py             # Save/load + Rust format interop
+├── train.py                      # Training script (DDP, AMP, wandb)
+├── generate_cli.py               # Generation CLI
+├── docs/
+│   ├── architecture.md           # Arquitectura del modelo
+│   ├── training_log.md           # Registro completo de entrenamiento
+│   ├── cuda_kernels.md           # Documentación de kernels CUDA
+│   └── observations.md           # Observaciones y lecciones aprendidas
+├── Dockerfile                    # GPU cloud container
 └── requirements.txt
 ```
