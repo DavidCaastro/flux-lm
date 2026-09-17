@@ -17,9 +17,9 @@ pub struct FluxModel<F: Float> {
     pub params: Vec<F>,
 }
 
-/// Per-layer params: 527*d (525 base + 2 adaptive decay)
+/// Per-layer params (v2/v3): 525*d
 pub fn flux_layer_param_count(d: usize) -> usize {
-    527 * d
+    525 * d
 }
 
 pub fn flux_total_param_count(
@@ -141,9 +141,5 @@ fn init_flux_layer<F: Float>(
     for k in 0..d {
         p[o + k] = F::from_f64(rng.gaussian_scaled(sc));
     }
-    o += d;
-
-    // w_adapt_fast, w_adapt_slow: init to 0 (degrades to fixed lambda)
-    o += d; // w_adapt_fast zeros
-    let _ = o; // w_adapt_slow zeros
+    let _ = o;
 }
