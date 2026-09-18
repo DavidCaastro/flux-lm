@@ -544,7 +544,9 @@ def train_one_epoch(model, loader, optimizer, scaler, amp_ctx,
         try:
             with amp_ctx:
                 _, loss = model(x, y)
-                loss = loss / grad_accum
+                # E5: orthogonality regularization on SPM projections
+                raw = model.module if hasattr(model, 'module') else model
+                loss = (loss + 1e-4 * raw.ortho_loss()) / grad_accum
         except Exception as e:
             tlog(f"    [{bp}] FORWARD EXCEPTION: {e}")
             traceback.print_exc()

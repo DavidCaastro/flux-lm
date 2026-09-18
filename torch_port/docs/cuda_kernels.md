@@ -22,7 +22,7 @@ Walsh-Hadamard Transform usando butterfly factorization.
 
 ## 2. Constant-Decay Parallel Scan (`kernels.py`)
 
-Scan recurrente con decay constante (usado por SPM).
+Scan recurrente con decay constante (usado por SPM — Slow Persistent Memory).
 
 ```
 y[t] = λ * y[t-1] + x[t]    donde λ es constante por dimensión

@@ -151,6 +151,7 @@ class FluxLayer(nn.Module):
         self.b_in_slow = nn.Parameter(torch.ones(d))
         self.c_out_slow = nn.Parameter(torch.empty(d))
         self.spm_delta = nn.Parameter(torch.empty(K))
+        self.spm_delta_mod = nn.Parameter(torch.zeros(K, K))  # content-dependent SPM decay
         self.spm_gate = nn.Parameter(torch.full((d,), -5.0))
         self._init_params()
 
@@ -174,22 +175,21 @@ class FluxLayer(nn.Module):
             self.spm_delta.copy_(-5.0 + frac_k * 2.0)
 
     def forward(self, x: torch.Tensor, byte_ids: torch.Tensor,
-                spm_w: torch.Tensor) -> torch.Tensor:
+                spm_w: torch.Tensor, spm_w_dec: torch.Tensor) -> torch.Tensor:
         if self.parallel:
-            return self._forward_parallel(x, byte_ids, spm_w)
-        return self._forward_sequential(x, byte_ids, spm_w)
+            return self._forward_parallel(x, byte_ids, spm_w, spm_w_dec)
+        return self._forward_sequential(x, byte_ids, spm_w, spm_w_dec)
 
     # ── Sequential (exact, O(T)) ──────────────────────────────────────
 
     def _forward_sequential(self, x: torch.Tensor, byte_ids: torch.Tensor,
-                            spm_w: torch.Tensor) -> torch.Tensor:
+                            spm_w: torch.Tensor, spm_w_dec: torch.Tensor) -> torch.Tensor:
         B, T, d = x.shape
-        lam_sem = torch.exp(-F.softplus(self.spm_delta))
         gate_sig = torch.sigmoid(self.spm_gate)
         h_fast = x.new_zeros(B, d)
         h_slow = x.new_zeros(B, d)
         h_sem = x.new_zeros(B, K)
-        cond = x.new_zeros(B, d)
+        modulation = x.new_ones(B, d)
         outputs = []
         for t in range(T):
             state = x[:, t, :]
@@ -207,21 +207,23 @@ class FluxLayer(nn.Module):
             h_fast = lam_fast * h_fast + self.b_in_fast * state
             h_slow = lam_slow * h_slow + self.b_in_slow * state
             if t % STRIDE == 0:
-                z = h_slow @ spm_w.T
+                z = h_slow @ spm_w.T                                          # E2: encode
+                lam_sem = torch.exp(-F.softplus(                              # E1: content-dependent decay
+                    self.spm_delta + h_sem @ self.spm_delta_mod))
                 h_sem = lam_sem * h_sem + (1 - lam_sem) * z
-                cond = (h_sem @ spm_w) * gate_sig
-            out = (self.c_out_fast * h_fast
-                   + self.c_out_slow * h_slow
-                   + self.skip * state
-                   + self.res_scale * x[:, t, :]
-                   + cond)
+                modulation = 1.0 + (h_sem @ spm_w_dec) * gate_sig            # E3: multiplicative
+            base = (self.c_out_fast * h_fast
+                    + self.c_out_slow * h_slow
+                    + self.skip * state
+                    + self.res_scale * x[:, t, :])
+            out = modulation * base                                           # E3: modulate
             outputs.append(out)
         return torch.stack(outputs, dim=1)
 
     # ── Parallel (mean-field + perturbative, O(T log T)) ──────────────
 
     def _forward_parallel(self, x: torch.Tensor, byte_ids: torch.Tensor,
-                          spm_w: torch.Tensor) -> torch.Tensor:
+                          spm_w: torch.Tensor, spm_w_dec: torch.Tensor) -> torch.Tensor:
         global _model_fwd_count
         verbose = _model_fwd_count <= _VERBOSE_UNTIL
         li = self.layer_idx
@@ -232,15 +234,13 @@ class FluxLayer(nn.Module):
                   f"fused={self.use_fused} n_corr={self.n_corrections}")
             _tlog(f"      L{li}: {_tstat('x_in', x)}")
 
-        # ── Decay lambdas (SPM only — fast/slow are now content-dependent) ──
+        # ── SPM gate (decay is now content-dependent, computed in SPM block) ──
         if verbose:
-            _tlog(f"      L{li}: computing decay lambdas (SPM)...")
+            _tlog(f"      L{li}: computing SPM gate...")
         t0 = time.time()
-        lam_sem = torch.exp(-F.softplus(self.spm_delta))
         gate_sig = torch.sigmoid(self.spm_gate)
         if verbose:
-            _tlog(f"      L{li}: lambdas OK ({time.time()-t0:.4f}s)")
-            _tlog(f"      L{li}: {_tstat('lam_sem', lam_sem)}")
+            _tlog(f"      L{li}: gate_sig OK ({time.time()-t0:.4f}s)")
             _tlog(f"      L{li}: {_tstat('gate_sig', gate_sig)}")
 
         # ── RMSNorm ──
@@ -361,7 +361,7 @@ class FluxLayer(nn.Module):
                 _tlog(f"      L{li}: scan h_slow OK ({time.time()-t0:.4f}s)")
                 _tlog(f"      L{li}: {_tstat('h_slow', h_slow)}")
 
-        # ── SPM ──
+        # ── SPM (E1: content-dependent decay, E2: asymmetric, E3: multiplicative) ──
         if verbose:
             _tlog(f"      L{li}: SPM computation...")
         t0 = time.time()
@@ -372,37 +372,40 @@ class FluxLayer(nn.Module):
             _tlog(f"      L{li}: SPM n_sub={n_sub}, "
                   f"{_tstat('h_slow_sub', h_slow_sub)}")
 
-        z_sub = h_slow_sub @ spm_w.T
+        z_sub = h_slow_sub @ spm_w.T                                         # E2: encode
         if verbose:
             _tlog(f"      L{li}: {_tstat('z_sub', z_sub)}")
 
-        if self.use_fused and z_sub.is_cuda:
-            if verbose:
-                _tlog(f"      L{li}: parallel_scan_fused h_sem "
-                      f"(shape={list(z_sub.shape)})...")
-            h_sem = parallel_scan_fused(lam_sem, (1 - lam_sem) * z_sub)
-        else:
-            if verbose:
-                _tlog(f"      L{li}: PyTorch scan h_sem...")
-            h_sem = parallel_scan(lam_sem, (1 - lam_sem) * z_sub)
+        # E1: content-dependent SPM decay — sequential scan over subsampled steps
+        # h_sem[t] depends on h_sem[t-1] for the decay, so we can't use constant-decay scan
+        B_cur = z_sub.shape[0]
+        h_sem_list = []
+        h_sem_t = z_sub.new_zeros(B_cur, K)
+        for si in range(n_sub):
+            lam_sem_t = torch.exp(-F.softplus(
+                self.spm_delta + h_sem_t @ self.spm_delta_mod))
+            h_sem_t = lam_sem_t * h_sem_t + (1 - lam_sem_t) * z_sub[:, si, :]
+            h_sem_list.append(h_sem_t)
+        h_sem = torch.stack(h_sem_list, dim=1)
+
         if verbose:
             _tlog(f"      L{li}: {_tstat('h_sem', h_sem)}")
 
-        cond_sub = (h_sem @ spm_w) * gate_sig
-        cond = cond_sub.repeat_interleave(STRIDE, dim=1)[:, :T, :]
+        cond_sub = (h_sem @ spm_w_dec) * gate_sig                            # E2: decode, E3 prep
+        modulation = 1.0 + cond_sub.repeat_interleave(STRIDE, dim=1)[:, :T, :]  # E3: multiplicative
         if verbose:
             dt = time.time() - t0
-            _tlog(f"      L{li}: SPM OK ({dt:.4f}s), {_tstat('cond', cond)}")
+            _tlog(f"      L{li}: SPM OK ({dt:.4f}s), {_tstat('modulation', modulation)}")
 
-        # ── Output ──
+        # ── Output (E3: multiplicative modulation) ──
         if verbose:
             _tlog(f"      L{li}: computing output...")
         t0 = time.time()
-        out = (self.c_out_fast * h_fast
-               + self.c_out_slow * h_slow
-               + self.skip * state
-               + self.res_scale * x
-               + cond)
+        base = (self.c_out_fast * h_fast
+                + self.c_out_slow * h_slow
+                + self.skip * state
+                + self.res_scale * x)
+        out = modulation * base
         if verbose:
             _tlog(f"      L{li}: output OK ({time.time()-t0:.4f}s)")
             _tlog(f"      L{li}: {_tstat('out', out)}")
@@ -427,7 +430,8 @@ class FluxModel(nn.Module):
         self.n_layers = n_layers
 
         self.embedding = nn.Embedding(256, d)
-        self.spm_w = nn.Parameter(torch.empty(K, d))
+        self.spm_w = nn.Parameter(torch.empty(K, d))      # encode: d→K
+        self.spm_w_dec = nn.Parameter(torch.empty(K, d))   # decode: K→d
         self.layers = nn.ModuleList([
             FluxLayer(d, li, parallel=parallel, n_corrections=n_corrections,
                       use_fused=use_fused)
@@ -443,6 +447,7 @@ class FluxModel(nn.Module):
         nn.init.normal_(self.embedding.weight, std=0.1)
         xavier = math.sqrt(2.0 / (K + d))
         nn.init.normal_(self.spm_w, std=xavier)
+        nn.init.normal_(self.spm_w_dec, std=xavier)
         he = math.sqrt(2.0 / (d + 256))
         nn.init.normal_(self.head_w, std=he)
 
@@ -474,7 +479,7 @@ class FluxModel(nn.Module):
             if layer_log:
                 _tlog(f"    #{cnt}: Layer {i}/{self.n_layers} entering...")
             t0 = time.time()
-            x = layer(x, byte_ids, self.spm_w)
+            x = layer(x, byte_ids, self.spm_w, self.spm_w_dec)
             dt = time.time() - t0
             if layer_log:
                 _tlog(f"    #{cnt}: Layer {i}/{self.n_layers} done "
@@ -502,6 +507,13 @@ class FluxModel(nn.Module):
         if verbose:
             _tlog(f"    #{cnt}: forward DONE (no loss)")
         return logits
+
+    def ortho_loss(self) -> torch.Tensor:
+        """E5: Encourage orthogonal rows in SPM projection matrices."""
+        eye = torch.eye(K, device=self.spm_w.device)
+        loss_enc = torch.norm(self.spm_w @ self.spm_w.T - eye) ** 2
+        loss_dec = torch.norm(self.spm_w_dec @ self.spm_w_dec.T - eye) ** 2
+        return loss_enc + loss_dec
 
     def count_params(self) -> int:
         return sum(p.numel() for p in self.parameters())

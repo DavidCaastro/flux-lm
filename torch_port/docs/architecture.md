@@ -14,7 +14,7 @@ Input bytes → Embedding(256, d) → L × FluxLayer → Output(d, 256) → soft
 |-----------|-------|
 | d (dimensión) | 512 |
 | L (capas) | 12 |
-| K (particiones SPM) | 4 |
+| K (particiones SPM — Slow Persistent Memory) | 4 |
 | Total params | ~3.51M |
 | Vocab | 256 (byte-level) |
 
@@ -65,21 +65,27 @@ h_slow[t] = λ_slow(t) * h_slow[t-1] + (1 - λ_slow(t)) * x[t]
 
 **Implementación:** parallel scan asociativo (Hillis-Steele) con kernel CUDA fusionado.
 
-### 4. Semantic Partition Module (SPM)
-Memoria semántica adicional con K=4 particiones de stride 4.
+### 4. Slow Persistent Memory (SPM)
+Memoria de contexto lento con K=4 particiones de stride 4. Captura tendencias
+macro de la señal (estructura, tema, modo) independientemente del dominio.
+
+> **Nota terminológica (2026-09-18):** SPM originalmente significaba "Semantic
+> Partition Module". Se redefinió como **Slow Persistent Memory** porque el
+> componente no es semántico en sí — es un filtro pasa-bajos domain-agnostic
+> sobre la representación interna. El acrónimo y el código se mantienen igual.
 
 ```
-h_sem[k] = λ_sem * h_sem[k][t-1] + (1 - λ_sem) * x[k*stride:(k+1)*stride]
+h_spm[k] = λ_spm * h_spm[k][t-1] + (1 - λ_spm) * x[k*stride:(k+1)*stride]
 ```
 
 - Decay constante (no content-dependent)
-- Gate SPM init: -5.0 (señal semántica casi apagada al inicio)
+- Gate SPM init: -5.0 (señal SPM casi apagada al inicio)
 - Usa kernel CUDA de scan constante (kernels.py)
 
 ### 5. Combinación y residual
 
 ```
-h_combined = W_mix · concat(h_fast, h_slow, h_sem) + b_mix
+h_combined = W_mix · concat(h_fast, h_slow, h_spm) + b_mix
 output = x + h_combined * (1 / ln(L + 2))
 ```
 
