@@ -33,11 +33,6 @@ def load_pytorch(path: str, device='cpu'):
         print(f"  [checkpoint] New params (init from scratch): {result.missing_keys}")
     if result.unexpected_keys:
         print(f"  [checkpoint] Unexpected keys (ignored): {result.unexpected_keys}")
-    # E2: copy trained spm_w into spm_w_dec if loading from pre-E2 checkpoint
-    if 'spm_w_dec' in result.missing_keys:
-        with torch.no_grad():
-            model.spm_w_dec.data.copy_(model.spm_w.data)
-        print("  [checkpoint] spm_w_dec initialized from trained spm_w (E2 compat)")
     return model, ckpt
 
 
