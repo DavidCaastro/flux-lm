@@ -665,3 +665,118 @@ ssh vast "nvidia-smi | grep python" # Ver si GPU en uso
 - Usar `.gitignore` para checkpoints y datos de entrenamiento
 - SSH keys: permisos `chmod 600` obligatorios en la clave privada
 - Si el repo es publico temporalmente, regresarlo a privado despues de transferir
+
+---
+
+## 16. Multi-GPU (DDP)
+
+### Seleccion de instancia multi-GPU
+
+```bash
+# Buscar 4x RTX 4090
+vastai search offers 'gpu_name=RTX 4090 num_gpus=4 gpu_ram>=24000 disk_space>=100 reliability>0.95' \
+  --order 'dph_total'
+```
+
+### Lanzar entrenamiento DDP
+
+```bash
+# Reemplazar "python3" por "torchrun --nproc_per_node=N"
+torchrun --nproc_per_node=4 train.py \
+    --corpus /workspace/corpus_python_200mb.txt \
+    --d 1024 --layers 12 --epochs 72 \
+    --batch-size 64 --seq-len 256 --lr 2e-4 \
+    --dtype bf16 --parallel --n-corrections 1 \
+    --grad-checkpoint --schedule cosine \
+    --ckpt-every 1 --print-every 1 --num-workers 2
+```
+
+### Consideraciones DDP
+
+| GPUs | Batch efectivo | Ajuste LR | Speedup esperado |
+|------|---------------|-----------|-------------------|
+| 1 | 64 | base (1e-4 o 3e-4) | 1× |
+| 2 | 128 | igual | ~1.95× |
+| 4 | 256 | ×2 (linear scaling) | ~3.8× |
+| 8 | 512 | ×2-3 + warmup | ~7× |
+
+- Con 2 GPUs no se necesita ajustar LR
+- Con 4+ GPUs: aplicar linear scaling rule (`lr *= N_gpus / base_gpus`) y considerar warmup de 1-2 epochs
+- El modelo (7M params) es pequenio — overhead de comunicacion DDP es despreciable
+- train.py ya soporta DDP nativo via `torchrun`
+
+### Costes estimados multi-GPU (RTX 4090, sept 2026)
+
+| Config | $/hora | 5 epochs (200MB) | 30 epochs (200MB) |
+|--------|--------|-------------------|---------------------|
+| 1× 4090 | ~$0.45 | ~$6 (13h) | ~$35 (78h) |
+| 2× 4090 | ~$0.90 | ~$6 (6.6h) | ~$35 (39h) |
+| 4× 4090 | ~$2.00 | ~$7 (3.3h) | ~$40 (20h) |
+
+Multi-GPU no ahorra dinero, ahorra tiempo. Coste total similar.
+
+---
+
+## 17. Resume Training (reanudacion)
+
+### Reanudacion basica
+
+```bash
+python3 train.py \
+    --corpus /workspace/corpus_python_200mb.txt \
+    --d 1024 --layers 12 --epochs 72 \
+    --batch-size 64 --seq-len 256 --lr 1e-4 \
+    --dtype bf16 --parallel --n-corrections 1 \
+    --grad-checkpoint --schedule cosine \
+    --ckpt /workspace/checkpoints_7m/flux_epoch_0067.pt \
+    --resume \
+    --ckpt-every 1 --ckpt-dir checkpoints_7m_200mb \
+    --print-every 1 --num-workers 2
+```
+
+### Que hace --resume
+
+- Restaura `model_state`, `optimizer_state`, `epoch` y `loss` del checkpoint
+- El schedule `cosine` calcula: `progress = (epoch - start_epoch) / (total_epochs - start_epoch)`
+  - Con `--epochs 72` y checkpoint epoch 67: crea cosine fresco de lr=1.0 a lr=0 en 5 epochs
+- `sign_history` (int64) del EntropicAdam se restaura correctamente (backup/restore para evitar corrupcion float32)
+
+### Cambiar corpus al reanudar
+
+Es valido reanudar con un corpus distinto (mas grande). El modelo conserva los pesos aprendidos. Efectos:
+- test_bpb subira temporalmente (distribucion ligeramente distinta)
+- Convergencia mas rapida que entrenar desde cero
+- El floor de convergencia deberia ser inferior gracias a mayor diversidad
+
+### Compatibilidad checkpoint/codigo
+
+> **CRITICO**: ver seccion de compatibilidad en `VAST_SETUP.md`. Si el codigo cambio entre el checkpoint y el codigo actual, pueden haber params faltantes que se inicializan incorrectamente.
+
+---
+
+## 18. Configuraciones de Entrenamiento Probadas
+
+### Run exitosos (resultados verificados)
+
+| Run | Modelo | Corpus | Epochs | LR | BPB final | Checkpoint |
+|-----|--------|--------|--------|-----|-----------|------------|
+| v1-v5 | 3.5M (d=512) | 60MB | 50 | 3e-4 | **0.963** | flux_epoch_0050.pt |
+| v6 | 7M (d=1024) | 60MB | 67 | 3e-4 | 1.092 | flux_epoch_0067.pt |
+| v7 | 7M (d=1024) | 200MB | 68-72 | 1e-4 | (en curso) | checkpoints_7m_200mb/ |
+
+### Run fallidos (evitar repetir)
+
+| Run | Error | Causa |
+|-----|-------|-------|
+| v4 (SGDR) | test_loss degrado 0.668→0.840 | Weight decay no escalaba con lr_scale |
+| v5 (SGDR ciclos 2-3) | Nunca recupero minimo | LR pico 3e-4 demasiado alto post-convergencia |
+
+### Flags que SIEMPRE se deben usar
+
+```
+--parallel            # Parallel scan (4-7× mas rapido que sequential)
+--grad-checkpoint     # Reduce VRAM ~81% (critico para batch-size 64)
+--n-corrections 1     # Correccion perturbativa (mejora calidad)
+--dtype bf16          # Mixed precision (2× throughput)
+--num-workers 2       # DataLoader paralelo
+```
