@@ -26,8 +26,15 @@ if ! command -v ninja &>/dev/null; then
 fi
 
 # ── 1. CUDA arch for RTX 4090 (Ada Lovelace, sm_89) ──
+# NGC images set TORCH_CUDA_ARCH_LIST in /etc/environment with ALL archs.
+# /etc/environment is loaded via PAM and overrides /etc/bash.bashrc.
+# We must fix BOTH to ensure sm_89 only (faster JIT, smaller binaries).
 export TORCH_CUDA_ARCH_LIST="8.9"
-if ! grep -q "TORCH_CUDA_ARCH_LIST" /etc/bash.bashrc 2>/dev/null; then
+if grep -q "TORCH_CUDA_ARCH_LIST" /etc/environment 2>/dev/null; then
+    sed -i 's|TORCH_CUDA_ARCH_LIST=.*|TORCH_CUDA_ARCH_LIST=8.9|g' /etc/environment
+    echo "  Fixed TORCH_CUDA_ARCH_LIST=8.9 in /etc/environment"
+fi
+if ! grep -q 'TORCH_CUDA_ARCH_LIST="8.9"' /etc/bash.bashrc 2>/dev/null; then
     echo 'export TORCH_CUDA_ARCH_LIST="8.9"' >> /etc/bash.bashrc
     echo "  TORCH_CUDA_ARCH_LIST=8.9 persisted to /etc/bash.bashrc"
 fi
