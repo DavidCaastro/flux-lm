@@ -229,7 +229,43 @@ SCP y SFTP fallan con "Connection closed by remote host" a mitad de transferenci
 
 ### Estrategias (ordenadas por fiabilidad)
 
-#### A. GitHub Release como intermediario (MEJOR para archivos >30MB)
+#### 0. `vastai copy` — CLI nativo (RECOMENDADO)
+
+Vast.ai tiene su propio sistema de transferencia que evita las limitaciones de SSH:
+
+```bash
+# Subir archivo local a instancia
+vastai copy local:./corpus_python_200mb.txt INSTANCE_ID:/workspace/corpus_python_200mb.txt
+
+# Descargar checkpoint de instancia a local
+vastai copy INSTANCE_ID:/workspace/checkpoints/flux_epoch_0050.pt local:./checkpoints/
+
+# Subir directorio completo
+vastai copy local:./torch_port/ INSTANCE_ID:/workspace/flux-lm/torch_port/
+
+# Con clave SSH especifica
+vastai copy -i ~/.ssh/id_vast local:./file INSTANCE_ID:/workspace/file
+```
+
+**Formatos de ruta soportados:**
+- `local:./path` — archivo local
+- `INSTANCE_ID:/path` — instancia por ID
+- `C.INSTANCE_ID:/path` — formato container explicito
+- `V.VOLUME_ID:/path` — volumen (ver seccion 7)
+- `s3.CONNECTION_ID:/path` — S3 via cloud connection
+- `drive:path` — Google Drive
+
+**Limitaciones:**
+- NO copiar a `/root` o `/` como destino (rompe permisos SSH)
+- Volumen ↔ local NO soportado directamente (usar instancia como intermediario)
+
+**Cuando usar `vastai copy` vs otros metodos:**
+- Archivos < 100 MB: `vastai copy` o `scp` — ambos funcionan
+- Archivos 100 MB - 1 GB: `vastai copy` (evita timeout SSH)
+- Archivos > 1 GB: `vastai copy` o GitHub Release (probar cual es mas estable)
+- Entre instancias/volumenes: `vastai copy` (unica opcion directa)
+
+#### A. GitHub Release como intermediario (alternativa para archivos >30MB)
 
 Usar GitHub Releases para transferir archivos grandes via la API, evitando las limitaciones de SSH.
 
@@ -330,18 +366,99 @@ ssh vast "rm /tmp/chunk_*"
   └── *.log          -> Logs de entrenamiento
 ```
 
-### Volumes (almacenamiento persistente externo)
+### Volumes (almacenamiento persistente)
+
+Los volumes son almacenamiento que **sobrevive a la destruccion de instancias**. Ideales para corpus y checkpoints que no quieres re-subir cada vez.
+
+#### Limitaciones importantes
+
+- **Locales**: un volume esta fisicamente atado a UNA maquina. No se puede mover a otra maquina.
+- **Tamanio fijo**: NO se puede redimensionar despues de crearlo. Elegir con cuidado.
+- **Solo Docker**: no funciona con instancias VM.
+- **Sin copia local directa**: no puedes hacer `vastai copy local:./file V.ID:/path`. Necesitas una instancia como intermediario.
+
+#### Ciclo de vida de un volume
 
 ```bash
-# Crear volume
-vastai create volume <offer_id> -s <size_GB> -n <nombre>
+# 1. Buscar ofertas de volume (muestra maquinas con espacio disponible)
+vastai search volumes
 
-# Montar al crear instancia
-vastai create instance <id> --image <img> -v V.<vol_id>:/mnt
+# 2. Crear volume (OFFER_ID del search, tamanio en GB, nombre alfanumerico)
+vastai create volume OFFER_ID -s 100 -n flux_data
+# Retorna: volume_id
 
-# Cloud sync soportado: S3, Google Drive, Backblaze, Dropbox, HuggingFace
-# NO soporta transferencia directa local -> volume
+# 3. Ver volumes existentes
+vastai show volumes
+
+# 4. Crear instancia CON volume montado
+vastai create instance GPU_OFFER_ID \
+  --image nvcr.io/nvidia/pytorch:26.08-py3 \
+  --disk 30 \
+  --ssh --direct \
+  --env '-v V.flux_data:/data'
+# El volume se monta en /data dentro del container
+
+# 5. Dentro de la instancia, el volume es un directorio normal
+ssh vast "ls /data"
+ssh vast "cp /workspace/checkpoints/best.pt /data/best.pt"
+
+# 6. Destruir instancia (el volume SOBREVIVE)
+vastai destroy instance INSTANCE_ID
+
+# 7. Crear NUEVA instancia en la MISMA maquina, remontar el volume
+vastai create instance OTRO_OFFER_MISMA_MAQUINA \
+  --image nvcr.io/nvidia/pytorch:26.08-py3 \
+  --disk 30 \
+  --ssh --direct \
+  --env '-v V.flux_data:/data'
+# /data tiene los mismos archivos que antes
+
+# 8. Eliminar volume (PERMANENTE, destruye todos los datos)
+vastai delete volume VOLUME_ID
 ```
+
+#### Transferencia de datos con volumes
+
+```bash
+# Instancia -> Volume
+vastai copy C.INSTANCE_ID:/workspace/checkpoint.pt V.VOLUME_ID:/data/checkpoint.pt
+
+# Volume -> Instancia
+vastai copy V.VOLUME_ID:/data/corpus.txt C.INSTANCE_ID:/workspace/corpus.txt
+
+# Volume -> S3 (requiere cloud connection configurada)
+vastai copy V.VOLUME_ID:/data/ s3.CONNECTION_ID:/bucket/backup/
+
+# Volume -> Volume (entre maquinas distintas)
+vastai copy V.SRC_ID:/data/ V.DST_ID:/data/
+```
+
+#### Caso de uso recomendado para Flux LM
+
+```bash
+# Crear volume de 150 GB para corpus + checkpoints
+vastai create volume OFFER_ID -s 150 -n flux_training
+
+# Estructura sugerida dentro del volume:
+# /data/
+#   ├── corpus/
+#   │   ├── corpus_python.txt        (60 MB)
+#   │   ├── corpus_python_200mb.txt  (200 MB)
+#   │   └── corpus_python_536mb.txt  (536 MB)
+#   └── checkpoints/
+#       ├── 3.5m_epoch50.pt          (41 MB)
+#       └── 7m_epoch67.pt            (82 MB)
+
+# Ventaja: si la instancia muere o la destruyes, los datos persisten.
+# Solo necesitas crear nueva instancia en la MISMA maquina y remontar.
+```
+
+#### Facturacion de volumes
+
+- Se cobra por GB/mes mientras la maquina host esta online
+- Si la maquina se apaga, NO se cobra
+- Precio visible al pasar mouse sobre "Rent" en la web, o en `vastai search volumes`
+- Puedes eliminar un volume mientras la maquina esta offline sin cargos
 
 ### Gestion de disco
 
@@ -779,4 +896,295 @@ Es valido reanudar con un corpus distinto (mas grande). El modelo conserva los p
 --n-corrections 1     # Correccion perturbativa (mejora calidad)
 --dtype bf16          # Mixed precision (2× throughput)
 --num-workers 2       # DataLoader paralelo
+```
+
+---
+
+## 19. Automatizacion CLI — Crear instancias sin web UI
+
+> Referencia oficial: https://docs.vast.ai/cli/hello-world
+
+### 19.1 Instalacion y autenticacion
+
+```bash
+# Instalar CLI (Linux/macOS/WSL)
+curl -fsSL https://vast.ai/install.sh | bash
+
+# O via pip (Windows/cualquier OS)
+pip install vastai
+
+# Configurar API key (obtener de https://cloud.vast.ai/manage-keys/)
+vastai set api-key TU_API_KEY
+
+# Verificar
+vastai show user
+```
+
+### 19.2 Registrar clave SSH
+
+```bash
+# Registrar clave publica existente
+vastai create ssh-key ~/.ssh/id_ed25519.pub
+
+# O generar una nueva
+vastai create ssh-key
+```
+
+### 19.3 Buscar ofertas de GPU
+
+```bash
+# RTX 4090, 1 GPU, verificada, con puerto directo
+vastai search offers \
+  'gpu_name=RTX_4090 num_gpus=1 verified=true direct_port_count>=1 rentable=true gpu_ram>=24 disk_space>=40 reliability>0.95' \
+  -o 'dph-' --type on-demand
+
+# 4x RTX 4090 para multi-GPU
+vastai search offers \
+  'gpu_name=RTX_4090 num_gpus=4 verified=true direct_port_count>=1 rentable=true disk_space>=100 reliability>0.95' \
+  -o 'dph-' --type on-demand
+
+# JSON para scripting
+vastai search offers \
+  'gpu_name=RTX_4090 num_gpus=1 verified=true rentable=true reliability>0.95' \
+  -o 'dph-' --raw
+```
+
+#### Filtros disponibles (seleccion relevante)
+
+| Filtro | Tipo | Descripcion | Ejemplo |
+|--------|------|-------------|---------|
+| `gpu_name` | string | Modelo GPU (underscores para espacios) | `RTX_4090` |
+| `num_gpus` | int | Numero de GPUs | `1`, `4` |
+| `gpu_ram` | float | RAM por GPU (GB) | `>=24` |
+| `gpu_total_ram` | float | RAM total todas GPUs (GB) | `>=96` |
+| `cpu_ram` | float | RAM sistema (GB) | `>=32` |
+| `cpu_cores` | int | Cores CPU virtuales | `>=8` |
+| `disk_space` | float | Disco (GB) | `>=50` |
+| `disk_bw` | float | Ancho banda disco (MB/s) | `>=500` |
+| `inet_down` | float | Descarga (Mb/s) | `>=500` |
+| `inet_up` | float | Subida (Mb/s) | `>=100` |
+| `reliability` | float | Score fiabilidad (0-1) | `>0.95` |
+| `verified` | bool | Maquina verificada | `true` |
+| `rentable` | bool | Disponible para alquilar | `true` |
+| `direct_port_count` | int | Puertos directos abiertos | `>=1` |
+| `cuda_vers` | float | Version CUDA maxima | `>=13.0` |
+| `compute_cap` | int | Compute capability ×100 | `>=890` (sm_89) |
+| `geolocation` | string | Codigo pais 2 letras | `US`, `DE` |
+| `dph` | float | Precio $/hora | `<=0.50` |
+| `duration` | float | Duracion maxima alquiler (dias) | `>7` |
+| `static_ip` | bool | IP estatica | `true` |
+
+#### Opciones de ordenamiento (`-o`)
+
+Append `-` para descendente: `-o 'dph-'` (mas barato primero), `-o 'dlperf_usd-'` (mejor rendimiento/precio).
+
+#### Tipos de instancia (`--type`)
+
+| Flag | Tipo | Descripcion |
+|------|------|-------------|
+| `-d` / `--on-demand` | On-demand | Precio fijo, sin interrupcion |
+| `-r` / `--reserved` | Reserved | ~50% descuento, sin interrupcion |
+| `-i` / `--interruptible` | Bid | Mas barato, puede ser interrumpida |
+
+### 19.4 Crear instancia
+
+```bash
+# OFFER_ID viene del resultado de search offers
+vastai create instance OFFER_ID \
+  --image nvcr.io/nvidia/pytorch:26.08-py3 \
+  --disk 50 \
+  --ssh --direct \
+  --lang-utf8 --python-utf8 \
+  --onstart-cmd 'bash -c "export TORCH_CUDA_ARCH_LIST=8.9 && sed -i s/TORCH_CUDA_ARCH_LIST=.*/TORCH_CUDA_ARCH_LIST=8.9/g /etc/environment && echo Done"'
+
+# Retorna JSON con: {"success": true, "new_contract": INSTANCE_ID}
+```
+
+#### Flags de create instance
+
+| Flag | Tipo | Default | Descripcion |
+|------|------|---------|-------------|
+| `--image` | string | (requerido) | Imagen Docker |
+| `--disk` | number | 10 GB | Disco local (NO se puede cambiar despues) |
+| `--ssh` | bool | — | Habilitar acceso SSH |
+| `--direct` | bool | — | Conexion directa (mas rapido) |
+| `--jupyter` | bool | — | Jupyter en vez de SSH |
+| `--onstart-cmd` | string | — | Comando al bootear (max 16KB) |
+| `--onstart` | string | — | Archivo de script onstart |
+| `--env` | string | — | Variables de entorno y puertos |
+| `--label` | string | — | Etiqueta de la instancia |
+| `--lang-utf8` | bool | — | Locale C.UTF-8 |
+| `--python-utf8` | bool | — | Python locale C.UTF-8 |
+| `--entrypoint` | string | — | Override container entrypoint |
+| `--bid_price` | number | — | Precio bid para interruptible ($/h) |
+| `--force` | bool | — | Saltar sanity checks |
+
+### 19.5 Monitorear y conectar
+
+```bash
+# Ver estado de instancia
+vastai show instance INSTANCE_ID
+# Status: loading → running (1-5 min boot)
+
+# Ver todas las instancias activas
+vastai show instances
+
+# Obtener URL SSH
+vastai ssh-url INSTANCE_ID
+# Retorna: ssh://root@HOST:PORT
+
+# Conectar
+ssh root@HOST -p PORT
+```
+
+### 19.6 Transferencia de archivos (CLI nativo)
+
+```bash
+# Subir archivos a instancia
+vastai copy local:./archivo.py INSTANCE_ID:/workspace/archivo.py
+
+# Descargar desde instancia
+vastai copy INSTANCE_ID:/workspace/checkpoint.pt local:./checkpoint.pt
+
+# Nota: para archivos >30MB, preferir GitHub Releases (ver seccion 6)
+```
+
+### 19.7 Ciclo de vida
+
+```bash
+# Pausar (detiene compute, sigue cobrando disco)
+vastai stop instance INSTANCE_ID
+
+# Reanudar instancia pausada
+vastai start instance INSTANCE_ID
+
+# Destruir (elimina TODO, detiene toda facturacion)
+vastai destroy instance INSTANCE_ID
+
+# Reiniciar
+vastai reboot instance INSTANCE_ID
+
+# Etiquetar
+vastai label instance INSTANCE_ID "flux-7m-training"
+```
+
+### 19.8 Script completo: crear instancia + setup + lanzar training
+
+```bash
+#!/bin/bash
+# flux_vast_deploy.sh — Automatiza creacion de instancia + setup + training
+set -euo pipefail
+
+# === Config ===
+GPU="RTX_4090"
+NUM_GPUS=1
+DISK=50
+IMAGE="nvcr.io/nvidia/pytorch:26.08-py3"
+REPO="https://github.com/DavidCaastro/flux-lm.git"
+
+# === 1. Buscar mejor oferta ===
+echo "Buscando ofertas ${GPU} x${NUM_GPUS}..."
+OFFER_ID=$(vastai search offers \
+  "gpu_name=${GPU} num_gpus=${NUM_GPUS} verified=true direct_port_count>=1 rentable=true reliability>0.95 disk_space>=${DISK}" \
+  -o 'dph-' --raw | python3 -c "import sys,json; offers=json.load(sys.stdin); print(offers[0]['id']) if offers else sys.exit(1)")
+
+echo "Mejor oferta: $OFFER_ID"
+
+# === 2. Crear instancia ===
+echo "Creando instancia..."
+RESULT=$(vastai create instance "$OFFER_ID" \
+  --image "$IMAGE" \
+  --disk "$DISK" \
+  --ssh --direct \
+  --python-utf8 \
+  --label "flux-training" \
+  --raw)
+
+INSTANCE_ID=$(echo "$RESULT" | python3 -c "import sys,json; print(json.load(sys.stdin)['new_contract'])")
+echo "Instancia creada: $INSTANCE_ID"
+
+# === 3. Esperar a que arranque ===
+echo "Esperando boot..."
+for i in $(seq 1 60); do
+  STATUS=$(vastai show instance "$INSTANCE_ID" --raw | python3 -c "import sys,json; print(json.load(sys.stdin)['actual_status'])" 2>/dev/null || echo "loading")
+  if [ "$STATUS" = "running" ]; then
+    echo "Instancia running!"
+    break
+  fi
+  sleep 10
+done
+
+# === 4. Obtener SSH ===
+SSH_URL=$(vastai ssh-url "$INSTANCE_ID")
+SSH_HOST=$(echo "$SSH_URL" | sed 's|ssh://root@||' | cut -d: -f1)
+SSH_PORT=$(echo "$SSH_URL" | cut -d: -f3)
+
+echo "SSH: ssh root@${SSH_HOST} -p ${SSH_PORT}"
+
+# === 5. Setup remoto ===
+echo "Ejecutando setup..."
+ssh -o StrictHostKeyChecking=no -p "$SSH_PORT" root@"$SSH_HOST" bash -s << 'REMOTE'
+  export TORCH_CUDA_ARCH_LIST="8.9"
+  sed -i 's/TORCH_CUDA_ARCH_LIST=.*/TORCH_CUDA_ARCH_LIST=8.9/g' /etc/environment 2>/dev/null
+  echo 'export TORCH_CUDA_ARCH_LIST="8.9"' >> /etc/bash.bashrc
+  cd /workspace
+  git clone REPO_PLACEHOLDER flux-lm 2>/dev/null || (cd flux-lm && git pull)
+  nvidia-smi --query-gpu=name,memory.total --format=csv,noheader
+  echo "Setup OK"
+REMOTE
+
+echo ""
+echo "=== LISTO ==="
+echo "Instancia: $INSTANCE_ID"
+echo "SSH: ssh root@${SSH_HOST} -p ${SSH_PORT}"
+echo ""
+echo "Siguiente paso: subir corpus y lanzar training"
+echo "  vastai copy local:./corpus.txt ${INSTANCE_ID}:/workspace/corpus.txt"
+echo "  ssh -p ${SSH_PORT} root@${SSH_HOST} 'cd /workspace/flux-lm/torch_port && bash vast_setup.sh'"
+```
+
+> **NOTA**: este script es una referencia. Ajustar REPO_PLACEHOLDER, paths de corpus, y parametros de training segun el run deseado. Probar cada paso manualmente la primera vez.
+
+### 19.9 API REST equivalente (curl)
+
+Para automatizacion avanzada sin CLI:
+
+```bash
+export VAST_API_KEY="tu-api-key"
+
+# Buscar ofertas
+curl -s -H "Authorization: Bearer $VAST_API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "verified": {"eq": true},
+    "rentable": {"eq": true},
+    "gpu_name": {"eq": "RTX 4090"},
+    "num_gpus": {"eq": 1},
+    "reliability": {"gte": 0.95},
+    "direct_port_count": {"gte": 1},
+    "order": [["dph_total", "asc"]],
+    "type": "on-demand",
+    "limit": 5
+  }' \
+  "https://console.vast.ai/api/v0/bundles/"
+
+# Crear instancia (OFFER_ID del resultado anterior)
+curl -s -H "Authorization: Bearer $VAST_API_KEY" \
+  -H "Content-Type: application/json" \
+  -X PUT \
+  -d '{
+    "image": "nvcr.io/nvidia/pytorch:26.08-py3",
+    "disk": 50,
+    "onstart": "echo done"
+  }' \
+  "https://console.vast.ai/api/v0/asks/OFFER_ID/"
+
+# Ver estado
+curl -s -H "Authorization: Bearer $VAST_API_KEY" \
+  "https://console.vast.ai/api/v0/instances/INSTANCE_ID/"
+
+# Destruir
+curl -s -H "Authorization: Bearer $VAST_API_KEY" \
+  -X DELETE \
+  "https://console.vast.ai/api/v0/instances/INSTANCE_ID/"
 ```
