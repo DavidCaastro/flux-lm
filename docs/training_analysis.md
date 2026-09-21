@@ -871,13 +871,42 @@ El gap de generalizacion menor del 7M (0.918 vs 0.966) sugiere que su mayor capa
 
 La unica muestra donde el 7M supera al 3.5M contiene constantes hexadecimales densas y operaciones bitwise — un patron de alta entropia intrinseca. La mayor dimensionalidad del 7M (d=1024 vs d=512) podria ayudar a representar patrones de bits mas complejos. Sin embargo, la diferencia es minima (-0.022 BPB).
 
-**5. Implicaciones para el entrenamiento con 200 MB**
+**5. Diagnostico por zonas de codigo**
 
-El entrenamiento actualmente en curso (7M con corpus 200MB, epochs 68-72) deberia:
-- Aumentar el ratio a ~1796 tok/param (similar al 3.5M con 60MB × 67 epochs)
-- Cerrar o invertir la brecha con el 3.5M
-- Reducir el gap de generalizacion al exponer mas diversidad de patrones
-- Si el 7M iguala o supera al 3.5M con 200MB, confirma definitivamente la hipotesis de insuficiencia de datos
+| Zona | Muestras | 3.5M BPB | 7M BPB | Interpretacion |
+|------|----------|----------|--------|----------------|
+| Codigo estructurado | quicksort, graphs, CLI, ECS | 1.58-1.92 | 1.85-2.12 | Patrones repetitivos (indentacion, `def`, `return`, `for`) bien aprendidos con mas datos |
+| Stdlib / networking | sockets, linked_list | 1.31-1.53 | 1.36-1.67 | Patrones de libreria estandar cubiertos en corpus, ventaja 3.5M clara |
+| Estilo funcional | functional_pipeline | 1.76 | 1.97 | Mayor delta (+0.211) — el 3.5M aprendio mejor la composicion funcional |
+| Codigo moderno | match/case (3.10+) | 2.21 | 2.24 | Debiles ambos — sintaxis rara, poco representada en cualquier corpus |
+| Alta entropia | crypto_hash | 3.39 | 3.37 | Limite intrinseco — constantes hex y bitwise son incompresibles, unica victoria 7M |
+| Metodos numericos | Newton-Raphson, Simpson | 2.25 | 2.44 | Formulas matematicas densas, ambos luchan pero 3.5M mejor |
+
+Observaciones:
+- Las zonas con BPB < 2.0 (estructurado, stdlib) son donde el 3.5M tiene mayor ventaja — son patrones de alta redundancia que se aprenden mejor con mas exposicion
+- Las zonas con BPB > 2.0 (moderno, crypto, numerico) son dificiles para ambos — aqui la diferencia entre modelos se reduce
+- El 7M solo gana en la zona de maxima entropia intrinseca, donde la dimensionalidad d=1024 ayuda marginalmente
+
+**6. Prediccion para el entrenamiento con 200 MB**
+
+El entrenamiento en curso (7M con corpus 200MB, epochs 68-72) aumenta el ratio de 540 a ~1796 tok/param. Escenarios estimados:
+
+| Escenario | Probabilidad | BPB ID esperado | Justificacion |
+|-----------|-------------|-----------------|---------------|
+| 7M supera al 3.5M | **Alta (70-80%)** | 0.85-0.95 | 3.3x mas datos + gap generalizacion menor indica capacidad latente; ratio tok/param superara al del 3.5M |
+| 7M iguala al 3.5M | Media (15-20%) | 0.95-1.00 | Posible si 5 epochs son insuficientes para convergir con corpus nuevo (necesitaria mas epochs) |
+| 7M sigue peor | Baja (5-10%) | >1.00 | Solo si la arquitectura post-SPM-enhancements tiene regresion no detectada, o el corpus 200MB tiene ruido excesivo |
+
+Evidencia que soporta el escenario optimista:
+- El gap de generalizacion menor del 7M (0.918 vs 0.966) indica representaciones internas mas transferibles
+- No hay overfitting (gap train-test identico: ~0.37 BPB) — el modelo tiene capacidad libre
+- El gap del 7M vs floor practico es amplio (+0.501 BPB) — hay margen de mejora concreto
+- Chinchilla scaling sugiere ~20 tok/param optimo; con 200MB en 5 epochs el 7M alcanzara ~134 tok/param por epoch, acumulando ~1796 tok/param total incluyendo las 67 epochs previas con 60MB
+
+Seniales de alerta a monitorear:
+- Si test_loss sube monotonamente tras epoch 68 → el LR (1e-4) podria ser demasiado alto para fine-tune
+- Si train_loss baja pero test_loss no → overfitting al corpus nuevo
+- Si grad_norm se dispara (>100 sostenido) → inestabilidad numerica
 
 ### 11.6 Archivos relacionados
 
