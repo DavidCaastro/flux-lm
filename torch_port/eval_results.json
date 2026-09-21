@@ -1,0 +1,262 @@
+{
+  "models": {
+    "3.5M": {
+      "ckpt": "C:\\Users\\Josue David Pe\u00f1uela\\Documents\\David\\flux-lm\\torch_port\\checkpoints\\flux_epoch_0050.pt",
+      "d": 512,
+      "params": 3520816
+    },
+    "7M": {
+      "ckpt": "C:\\Users\\Josue David Pe\u00f1uela\\Documents\\David\\flux-lm\\torch_port\\checkpoints_7m_v3\\flux_epoch_0067.pt",
+      "d": 1024,
+      "params": 7041328
+    }
+  },
+  "in_distribution": {
+    "3.5M": {
+      "weighted_bpb": 0.9767289137449134,
+      "mean_bpb": 0.9767289137449134,
+      "min_bpb": 0.30133223052842906,
+      "max_bpb": 1.6455127322635736,
+      "std_bpb": 0.40361643498604066,
+      "mean_accuracy": 0.8136541279921836,
+      "min_accuracy": 0.6888128969223254,
+      "max_accuracy": 0.9540791402051783,
+      "total_bytes": 40940,
+      "n_samples": 20
+    },
+    "7M": {
+      "weighted_bpb": 1.1507111574033337,
+      "mean_bpb": 1.1507111574033337,
+      "min_bpb": 0.4399982604455206,
+      "max_bpb": 2.028718041907969,
+      "std_bpb": 0.4414217766156579,
+      "mean_accuracy": 0.7856130923302393,
+      "min_accuracy": 0.6511968734733756,
+      "max_accuracy": 0.9330727894479727,
+      "total_bytes": 40940,
+      "n_samples": 20
+    }
+  },
+  "train_split": {
+    "3.5M": {
+      "weighted_bpb": 1.3430507754440162,
+      "mean_bpb": 1.3430507754440162,
+      "min_bpb": 0.40271949260309314,
+      "max_bpb": 2.1967116980968084,
+      "std_bpb": 0.5717711991128418,
+      "mean_accuracy": 0.7411822178798241,
+      "min_accuracy": 0.5999022960429897,
+      "max_accuracy": 0.9276990718124084,
+      "total_bytes": 20470,
+      "n_samples": 10
+    },
+    "7M": {
+      "weighted_bpb": 1.5237468164944616,
+      "mean_bpb": 1.5237468164944616,
+      "min_bpb": 0.5382817167530386,
+      "max_bpb": 2.5061332935009863,
+      "std_bpb": 0.615716644311876,
+      "mean_accuracy": 0.7152906692721055,
+      "min_accuracy": 0.5832926233512458,
+      "max_accuracy": 0.9081582804103566,
+      "total_bytes": 20470,
+      "n_samples": 10
+    }
+  },
+  "out_of_distribution": {
+    "3.5M": {
+      "weighted_bpb": 1.9429939654571564,
+      "mean_bpb": 1.9757061697799567,
+      "min_bpb": 1.3129368199962423,
+      "max_bpb": 3.3873271465306294,
+      "std_bpb": 0.5414208199777105,
+      "mean_accuracy": 0.6438699644252205,
+      "min_accuracy": 0.4435064935064935,
+      "max_accuracy": 0.7405764966740577,
+      "total_bytes": 16180,
+      "n_samples": 10
+    },
+    "7M": {
+      "weighted_bpb": 2.0685922033699975,
+      "mean_bpb": 2.097744109654447,
+      "min_bpb": 1.3580672966201641,
+      "max_bpb": 3.3650821153274664,
+      "std_bpb": 0.5086949360291247,
+      "mean_accuracy": 0.6285006156198529,
+      "min_accuracy": 0.4642857142857143,
+      "max_accuracy": 0.7420546932742055,
+      "total_bytes": 16180,
+      "n_samples": 10
+    }
+  },
+  "ood_per_sample": {
+    "3.5M": {
+      "algorithm_quicksort": {
+        "bpb": 1.8713807017767463,
+        "loss_nats": 1.2971422571908435,
+        "accuracy_top1": 0.6594948550046773,
+        "total_bytes": 1069,
+        "name": "algorithm_quicksort",
+        "time_s": 6.0810887813568115
+      },
+      "datastructure_linked_list": {
+        "bpb": 1.3129368199962423,
+        "loss_nats": 0.9100584550337358,
+        "accuracy_top1": 0.7405764966740577,
+        "total_bytes": 1353,
+        "name": "datastructure_linked_list",
+        "time_s": 8.000259399414062
+      },
+      "modern_python_match": {
+        "bpb": 2.213603210551835,
+        "loss_nats": 1.5343528242724473,
+        "accuracy_top1": 0.6011183597390494,
+        "total_bytes": 1073,
+        "name": "modern_python_match",
+        "time_s": 7.7705323696136475
+      },
+      "graph_algorithms": {
+        "bpb": 1.9239991609871934,
+        "loss_nats": 1.3336145938379733,
+        "accuracy_top1": 0.6632406287787183,
+        "total_bytes": 1654,
+        "name": "graph_algorithms",
+        "time_s": 14.303434133529663
+      },
+      "crypto_hash": {
+        "bpb": 3.3873271465306294,
+        "loss_nats": 2.3479162612518705,
+        "accuracy_top1": 0.4435064935064935,
+        "total_bytes": 1540,
+        "name": "crypto_hash",
+        "time_s": 9.38431167602539
+      },
+      "functional_pipeline": {
+        "bpb": 1.7629090918645849,
+        "loss_nats": 1.2219554666094306,
+        "accuracy_top1": 0.65086887835703,
+        "total_bytes": 1266,
+        "name": "functional_pipeline",
+        "time_s": 6.650113582611084
+      },
+      "socket_server": {
+        "bpb": 1.5281707524406325,
+        "loss_nats": 1.0592472484683946,
+        "accuracy_top1": 0.7142857142857143,
+        "total_bytes": 2121,
+        "name": "socket_server",
+        "time_s": 21.91019034385681
+      },
+      "numerical_methods": {
+        "bpb": 2.2472520330823986,
+        "loss_nats": 1.5576764107386696,
+        "accuracy_top1": 0.6177451634422949,
+        "total_bytes": 1499,
+        "name": "numerical_methods",
+        "time_s": 21.354883909225464
+      },
+      "game_logic_ecs": {
+        "bpb": 1.8332176937903106,
+        "loss_nats": 1.270689675803359,
+        "accuracy_top1": 0.6705202312138728,
+        "total_bytes": 2076,
+        "name": "game_logic_ecs",
+        "time_s": 25.496347427368164
+      },
+      "cli_tool_argparse": {
+        "bpb": 1.6762650867789959,
+        "loss_nats": 1.161898418771933,
+        "accuracy_top1": 0.6773428232502966,
+        "total_bytes": 2529,
+        "name": "cli_tool_argparse",
+        "time_s": 36.28165149688721
+      }
+    },
+    "7M": {
+      "algorithm_quicksort": {
+        "bpb": 2.0447420659591184,
+        "loss_nats": 1.4173071979918805,
+        "accuracy_top1": 0.627689429373246,
+        "total_bytes": 1069,
+        "name": "algorithm_quicksort",
+        "time_s": 15.214470863342285
+      },
+      "datastructure_linked_list": {
+        "bpb": 1.3580672966201641,
+        "loss_nats": 0.9413405176629337,
+        "accuracy_top1": 0.7420546932742055,
+        "total_bytes": 1353,
+        "name": "datastructure_linked_list",
+        "time_s": 17.01268482208252
+      },
+      "modern_python_match": {
+        "bpb": 2.237002201283455,
+        "loss_nats": 1.5505717687260183,
+        "accuracy_top1": 0.5936626281453867,
+        "total_bytes": 1073,
+        "name": "modern_python_match",
+        "time_s": 18.797736883163452
+      },
+      "graph_algorithms": {
+        "bpb": 2.118587367865085,
+        "loss_nats": 1.4684928608055992,
+        "accuracy_top1": 0.6475211608222491,
+        "total_bytes": 1654,
+        "name": "graph_algorithms",
+        "time_s": 14.869390487670898
+      },
+      "crypto_hash": {
+        "bpb": 3.3650821153274664,
+        "loss_nats": 2.33249718059193,
+        "accuracy_top1": 0.4642857142857143,
+        "total_bytes": 1540,
+        "name": "crypto_hash",
+        "time_s": 24.162362098693848
+      },
+      "functional_pipeline": {
+        "bpb": 1.9743850540176653,
+        "loss_nats": 1.36853943353204,
+        "accuracy_top1": 0.6437598736176935,
+        "total_bytes": 1266,
+        "name": "functional_pipeline",
+        "time_s": 17.99943733215332
+      },
+      "socket_server": {
+        "bpb": 1.667389530626183,
+        "loss_nats": 1.1557463520487092,
+        "accuracy_top1": 0.6676096181046676,
+        "total_bytes": 2121,
+        "name": "socket_server",
+        "time_s": 22.893882036209106
+      },
+      "numerical_methods": {
+        "bpb": 2.4412613939645746,
+        "loss_nats": 1.6921534522363868,
+        "accuracy_top1": 0.5923949299533022,
+        "total_bytes": 1499,
+        "name": "numerical_methods",
+        "time_s": 21.389790773391724
+      },
+      "game_logic_ecs": {
+        "bpb": 1.9257577792404927,
+        "loss_nats": 1.3348335751219291,
+        "accuracy_top1": 0.6599229287090559,
+        "total_bytes": 2076,
+        "name": "game_logic_ecs",
+        "time_s": 33.363805532455444
+      },
+      "cli_tool_argparse": {
+        "bpb": 1.8451662916402614,
+        "loss_nats": 1.278971812714697,
+        "accuracy_top1": 0.6461051799130091,
+        "total_bytes": 2529,
+        "name": "cli_tool_argparse",
+        "time_s": 42.944985151290894
+      }
+    }
+  },
+  "generalization_gap": {
+    "3.5M": 0.966265051712243,
+    "7M": 0.9178810459666638
+  }
+}

@@ -1,23 +1,19 @@
 #!/bin/bash
 # ============================================================
-# Flux LM 7M — Selective Scan fine-tuning (resume from epoch 67)
+# Flux LM 7M — Corpus scaling test (resume from epoch 67)
 #
-# Objetivo: activar content-dependent decay sobre modelo 7M convergido
+# Objetivo: evaluar si corpus 200MB desbloquea capacidad del 7M
 # Config: d=1024, L=12, B=64, T=256, lr=1e-4, cosine, bf16
-# LR reducido (1e-4 vs 3e-4 original) para no destruir pesos
-# convergidos — leccion aprendida del fallo SGDR en 3.5M.
-#
-# Selective scan: delta_fast_mod y delta_slow_mod estan en el
-# checkpoint como zeros. Al resumir, el modelo aprende decays
-# variables gradualmente sin perder lo aprendido.
+# Corpus: 200MB Python (3.3x mas datos que run v3)
+# Resume desde epoch 67 (best 7M, test_bpb=1.092)
 # ============================================================
 
 set -euo pipefail
 
-CORPUS="/workspace/corpus_python.txt"
+CORPUS="/workspace/corpus_python_200mb.txt"
 CKPT="/workspace/flux-lm/torch_port/checkpoints_7m_v3/flux_epoch_0067.pt"
-CKPT_DIR="/workspace/flux-lm/torch_port/checkpoints_7m_selective"
-LOG="/workspace/train_7m_selective.log"
+CKPT_DIR="/workspace/flux-lm/torch_port/checkpoints_7m_200mb"
+LOG="/workspace/train_7m_200mb.log"
 
 # Verificaciones
 if [ ! -f "$CORPUS" ]; then
@@ -33,11 +29,11 @@ fi
 mkdir -p "$CKPT_DIR"
 
 echo "============================================================"
-echo " Flux LM 7M — Selective Scan fine-tuning"
-echo " Resume: epoch 67 -> 87 (20 epochs)"
-echo " LR: 1e-4 (reducido, cosine decay)"
+echo " Flux LM 7M — Corpus scaling test (200MB)"
+echo " Resume: epoch 67 -> 72 (5 epochs)"
+echo " LR: 1e-4 (cosine decay)"
 echo " Checkpoint: $CKPT"
-echo " Guardado: cada 2 epochs en $CKPT_DIR"
+echo " Guardado: cada epoch en $CKPT_DIR"
 echo " Corpus: $CORPUS ($(du -h "$CORPUS" | cut -f1))"
 echo " Log: $LOG"
 echo "============================================================"
@@ -53,7 +49,7 @@ nohup python train.py \
     --lr 1e-4 \
     --weight-decay 1e-5 \
     --max-grad-norm 5.0 \
-    --epochs 87 \
+    --epochs 72 \
     --schedule cosine \
     --dtype bf16 \
     --parallel \
@@ -61,7 +57,7 @@ nohup python train.py \
     --grad-checkpoint \
     --ckpt "$CKPT" \
     --resume \
-    --ckpt-every 2 \
+    --ckpt-every 1 \
     --ckpt-dir "$CKPT_DIR" \
     --print-every 1 \
     --num-workers 2 \

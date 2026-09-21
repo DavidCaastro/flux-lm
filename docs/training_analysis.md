@@ -714,3 +714,177 @@ Todos son codigo Python del mismo scope (repos open-source de GitHub).
 3. **Comparar BPB**: 7M-60MB vs 7M-200MB vs 3.5M-60MB para aislar efecto de datos vs parametros.
 4. **Si 200MB mejora**: considerar corpus 536MB con epochs reducidos (20 epochs, ~5.8 dias).
 5. **Sweep de learning rate**: {1e-4, 2e-4, 3e-4, 5e-4} con cosine schedule sobre 200MB.
+
+## 11. Evaluacion Comparativa 3.5M vs 7M (2026-09-21)
+
+### 11.1 Objetivo
+
+Evaluar y comparar las capacidades reales de ambos modelos en tres escenarios:
+1. **In-Distribution (ID)**: muestras aleatorias del test split del corpus de entrenamiento
+2. **Train split**: muestras del train split para medir overfitting
+3. **Out-of-Distribution (OOD)**: codigo Python escrito a mano, con patrones NO presentes en el corpus
+
+Metricas: BPB (bits per byte), accuracy top-1 (prediccion del siguiente byte), gap de generalizacion.
+
+### 11.2 Incompatibilidad de checkpoint — hallazgo critico
+
+**Problema detectado**: la primera ejecucion de la evaluacion produjo resultados anomalos para el modelo 3.5M:
+
+| Modelo | BPB ID | Accuracy ID | Esperado |
+|--------|--------|-------------|----------|
+| 3.5M | 12.814 | 10.9% | ~0.96 BPB |
+| 7M | 1.151 | 78.6% | ~1.09 BPB |
+
+Un BPB de 12.8 es **peor que aleatorio** (8.0 BPB = sin compresion), indicando que el modelo no solo falla sino que anti-predice con alta confianza.
+
+**Causa raiz**: el checkpoint 3.5M (epoch 50) fue entrenado con una version anterior del codigo (`model.py` pre-commit `53bafd6`). Dos commits posteriores introdujeron cambios arquitectonicos incompatibles:
+
+| Commit | Cambio | Impacto en checkpoint viejo |
+|--------|--------|-----------------------------|
+| `53bafd6` (SPM enhancements) | E2: `spm_w_dec` separada para decodificacion | Param nuevo init aleatorio → decodificacion SPM basura |
+| `53bafd6` (SPM enhancements) | E3: output multiplicativo `(1+cond)*base` en vez de aditivo `base+cond` | Con cond basura, multiplica el output por valores erroneos |
+| `53bafd6` (SPM enhancements) | E1: `spm_delta_mod` para decay SPM content-dependent | Param nuevo init zeros → impacto menor (neutral) |
+| `7b07e41` (c_out gating) | `w_c_fast`/`w_c_slow` para gating dinamico | Params nuevos init zeros → impacto neutral |
+
+El mecanismo de carga (`strict=False` en `checkpoint.py`) permite cargar checkpoints con params faltantes, inicializandolos desde la definicion del modelo. Esto es util para evolucion incremental, pero **no detecta incompatibilidades en la logica del forward pass**. En este caso:
+
+- `spm_w_dec` se inicializa con `nn.init.normal_()` → **valores aleatorios**, no zeros
+- La formula cambio de aditiva a multiplicativa → incluso un `cond` pequenio pero ruidoso destruye la salida
+- El resultado: logits con media -14.27 y std 9.54, predicciones sistematicamente erroneas
+
+**Verificacion**: al cargar el 3.5M con el codigo original (commit `4c20b52`):
+- Missing params: 0, Unexpected params: 0 (compatibilidad perfecta)
+- BPB: 2.761, Accuracy: 53.8% en texto corto — modelo funcional
+
+El 7M (epoch 67) **no tiene este problema** porque fue entrenado con el codigo post-SPM-enhancements, y su checkpoint contiene todos los params nuevos (spm_w_dec, spm_delta_mod, w_c_fast, w_c_slow).
+
+**Solucion aplicada**: `eval_comparison.py` carga el 3.5M usando `flux/model_old.py` (copia exacta del model.py en commit `4c20b52`, pre-SPM-enhancements) y el 7M con el `model.py` actual. Esto garantiza que cada modelo se evalua con la arquitectura con la que fue entrenado.
+
+**Leccion**: `strict=False` no es suficiente para detectar breaking changes. Cuando la logica del forward pass cambia (no solo los params), los checkpoints viejos son silenciosamente incompatibles. Opciones para el futuro:
+1. Guardar un hash o version del model.py en cada checkpoint
+2. Mantener un registro de commits que rompen compatibilidad
+3. Testear checkpoints viejos tras cada cambio arquitectonico
+
+### 11.3 Configuracion del experimento
+
+| Parametro | Valor |
+|-----------|-------|
+| Hardware | Intel i5-1235U (CPU), Windows 11, sin GPU |
+| Modelo 3.5M | epoch 50, d=512, 3,508,528 params, codigo pre-SPM (`model_old.py`) |
+| Modelo 7M | epoch 67, d=1024, 7,041,328 params, codigo actual (`model.py`) |
+| Modo de inferencia | Sequential (`parallel=False`) — recurrencia exacta, sin aproximacion |
+| Corpus | corpus_python.txt (62.9 MB), split 90/10 |
+| ID samples | 20 muestras × 2048 bytes del test split (posiciones aleatorias fijas con seed) |
+| Train samples | 10 muestras × 2048 bytes del train split |
+| OOD samples | 10 muestras escritas a mano (1070-2530 bytes), codigo Python no incluido en corpus |
+| seq_len | 256 (ventana de evaluacion, consistente con entrenamiento) |
+
+### 11.4 Muestras Out-of-Distribution
+
+Las muestras OOD fueron disenadas para cubrir dominios y patrones ausentes del corpus de entrenamiento:
+
+| Muestra | Descripcion | Bytes | Motivo OOD |
+|---------|-------------|-------|------------|
+| algorithm_quicksort | Quicksort + merge sort desde cero | 1070 | Algoritmos clasicos, no de libreria |
+| datastructure_linked_list | Lista enlazada con iteradores | 1354 | Estructuras de datos manuales |
+| modern_python_match | Pattern matching (Python 3.10+) | 1074 | Sintaxis `match/case` post-3.9 |
+| graph_algorithms | Grafos: BFS, Dijkstra, topological sort | 1655 | Algoritmos de grafos desde cero |
+| crypto_hash | SHA-256 parcial, bit manipulation | 1541 | Criptografia, ops bitwise densas |
+| functional_pipeline | Pipelines funcionales, composicion | 1267 | Estilo funcional puro, no OOP |
+| socket_server | Servidor TCP asincrono con select | 2122 | Networking bajo nivel, stdlib |
+| numerical_methods | Newton-Raphson, integracion Simpson | 1500 | Metodos numericos, formulas matematicas |
+| game_logic_ecs | Sistema Entity-Component-System | 2077 | Game dev, patron ECS |
+| cli_tool_argparse | CLI con argparse, subcomandos | 2530 | Herramienta de linea de comandos |
+
+### 11.5 Resultados
+
+> **Nota**: los resultados de la primera ejecucion (3.5M con codigo nuevo) estan documentados en la seccion 11.2 como evidencia del bug. Los resultados validos corresponden a la segunda ejecucion con la correccion aplicada (3.5M con `model_old.py`).
+
+#### 11.5.1 Resumen agregado
+
+| Metrica | 3.5M | 7M | Delta | Ganador |
+|---------|------|-----|-------|---------|
+| BPB ID (weighted) | **0.977** | 1.151 | -0.174 | 3.5M |
+| BPB ID (std) | **0.404** | 0.441 | -0.038 | 3.5M |
+| Accuracy ID (top-1) | **81.4%** | 78.6% | +2.8pp | 3.5M |
+| BPB Train | **1.343** | 1.524 | -0.181 | 3.5M |
+| Accuracy Train | **74.1%** | 71.5% | +2.6pp | 3.5M |
+| BPB OOD (weighted) | **1.943** | 2.069 | -0.126 | 3.5M |
+| BPB OOD (std) | 0.541 | **0.509** | -0.033 | 7M |
+| Accuracy OOD | **64.4%** | 62.9% | +1.5pp | 3.5M |
+| Gap generalizacion (OOD-ID) | 0.966 | **0.918** | -0.048 | 7M |
+| Gap overfitting (train-test) | **0.366** | 0.373 | -0.007 | 3.5M |
+| Compresion efectiva | **8.2:1** | 7.0:1 | +1.2 | 3.5M |
+
+**Resultado principal**: el 3.5M supera al 7M en TODAS las metricas principales excepto gap de generalizacion y varianza OOD.
+
+#### 11.5.2 Desglose OOD por muestra
+
+| Muestra | 3.5M BPB | 7M BPB | Delta | Ganador | 3.5M Acc | 7M Acc |
+|---------|----------|--------|-------|---------|----------|--------|
+| algorithm_quicksort | **1.871** | 2.045 | +0.173 | 3.5M | **65.9%** | 62.8% |
+| datastructure_linked_list | **1.313** | 1.358 | +0.045 | 3.5M | 74.1% | **74.2%** |
+| modern_python_match | **2.214** | 2.237 | +0.023 | 3.5M | **60.1%** | 59.4% |
+| graph_algorithms | **1.924** | 2.119 | +0.195 | 3.5M | **66.3%** | 64.8% |
+| crypto_hash | 3.387 | **3.365** | -0.022 | 7M | 44.4% | **46.4%** |
+| functional_pipeline | **1.763** | 1.974 | +0.211 | 3.5M | **65.1%** | 64.4% |
+| socket_server | **1.528** | 1.667 | +0.139 | 3.5M | **71.4%** | 66.8% |
+| numerical_methods | **2.247** | 2.441 | +0.194 | 3.5M | **61.8%** | 59.2% |
+| game_logic_ecs | **1.833** | 1.926 | +0.093 | 3.5M | **67.1%** | 66.0% |
+| cli_tool_argparse | **1.676** | 1.845 | +0.169 | 3.5M | **67.7%** | 64.6% |
+
+El 3.5M gana **9 de 10** muestras OOD en BPB. La unica excepcion es `crypto_hash` (BPB pesado con constantes hexadecimales y operaciones bitwise), donde el 7M gana por un margen minimo (-0.022 BPB). En accuracy, el 7M solo gana en `crypto_hash` y empata en `datastructure_linked_list`.
+
+#### 11.5.3 Comparacion con cotas teoricas
+
+| Referencia | BPB |
+|------------|-----|
+| Shannon floor (Python, modelo infinito) | ~0.3-0.5 |
+| Floor practico (3.5M params) | ~0.6-0.7 |
+| **3.5M ID actual** | **0.977** |
+| **7M ID actual** | **1.151** |
+| Trivial (sin compresion, 8 bits/byte) | 8.000 |
+
+- Gap 3.5M vs floor practico: +0.327 BPB — margen de mejora moderado
+- Gap 7M vs floor practico: +0.501 BPB — margen de mejora amplio
+- Compresion efectiva 3.5M: 8.2:1 (cada byte predecido con ~0.977 bits en promedio)
+- Compresion efectiva 7M: 7.0:1
+
+#### 11.5.4 Analisis e interpretacion
+
+**1. El 3.5M es inequivocamente superior con el corpus actual (60 MB)**
+
+Con el doble de tokens por parametro (1080 vs 540), el 3.5M extrae mas informacion de los datos disponibles. El 7M tiene capacidad de representacion sobrante que no puede aprovechar por falta de datos — equivale a una red con overfitting latente que no se manifiesta como overfitting clasico (el gap train-test es similar) sino como **suboptimalidad en la convergencia**: los pesos no han visto suficiente diversidad para especializarse.
+
+**2. La ventaja del 3.5M es consistente (ID y OOD)**
+
+La diferencia no es un artefacto del test split:
+- ID: 3.5M gana por 0.174 BPB (17.8% menos error vs floor)
+- OOD: 3.5M gana por 0.126 BPB
+- La ventaja se reduce en OOD (-0.048 BPB), lo cual indica que el 7M generaliza ligeramente mejor en proporcion — su gap de generalizacion (0.918) es menor que el del 3.5M (0.966)
+
+**3. El 7M generaliza mejor en proporcion pero peor en absoluto**
+
+El gap de generalizacion menor del 7M (0.918 vs 0.966) sugiere que su mayor capacidad le permite capturar patrones mas transferibles, pero no puede materializarlos en predicciones competitivas sin mas datos. Esto es consistente con la hipotesis de underfitting por datos insuficientes.
+
+**4. crypto_hash es el unico punto fuerte del 7M**
+
+La unica muestra donde el 7M supera al 3.5M contiene constantes hexadecimales densas y operaciones bitwise — un patron de alta entropia intrinseca. La mayor dimensionalidad del 7M (d=1024 vs d=512) podria ayudar a representar patrones de bits mas complejos. Sin embargo, la diferencia es minima (-0.022 BPB).
+
+**5. Implicaciones para el entrenamiento con 200 MB**
+
+El entrenamiento actualmente en curso (7M con corpus 200MB, epochs 68-72) deberia:
+- Aumentar el ratio a ~1796 tok/param (similar al 3.5M con 60MB × 67 epochs)
+- Cerrar o invertir la brecha con el 3.5M
+- Reducir el gap de generalizacion al exponer mas diversidad de patrones
+- Si el 7M iguala o supera al 3.5M con 200MB, confirma definitivamente la hipotesis de insuficiencia de datos
+
+### 11.6 Archivos relacionados
+
+| Archivo | Descripcion |
+|---------|-------------|
+| `torch_port/eval_comparison.py` | Script de evaluacion comparativa |
+| `torch_port/eval_results.json` | Resultados en formato JSON (generado automaticamente) |
+| `torch_port/flux/model_old.py` | Copia del model.py pre-SPM-enhancements (commit `4c20b52`) |
+| `torch_port/checkpoints/flux_epoch_0050.pt` | Checkpoint 3.5M (mejor, BPB=0.963 en training) |
+| `torch_port/checkpoints_7m_v3/flux_epoch_0067.pt` | Checkpoint 7M (mejor, BPB=1.092 en training) |
