@@ -685,10 +685,32 @@ Nota: La diferencia de VRAM entre 3.5M (10 GB) y 7M (3.8 GB) es contraintuitiva.
 - No se midio la calidad generativa (perplexity en generacion, coherencia semantica).
 - Hiperparametros no fueron optimizados sistematicamente (no grid search, no Bayesian optimization).
 
-### 10.3 Proximos pasos experimentales sugeridos
+### 10.3 Corpus disponibles para escalamiento
 
-1. **Ampliar corpus** (>500 MB) y re-entrenar 7M para evaluar si la capacidad extra se traduce en mejor BPB con datos suficientes.
+Verificacion (2026-09-21) de los corpus presentes en la instancia vast.ai:
+
+| Corpus | Tamanio | Train chunks | Batches/epoch (B=64) | tok/param (7M, 67ep) | Tiempo/epoch est. |
+|--------|---------|-------------|---------------------|---------------------|-------------------|
+| corpus_python.txt | 60 MB | 221,248 | 3,457 | 540 | ~47 min |
+| corpus_python_200mb.txt | 200 MB | 737,280 | 11,520 | 1,796 | ~157 min |
+| corpus_python_1gb.txt | 536 MB | 1,974,952 | 30,858 | 4,811 | ~422 min |
+
+Todos son codigo Python del mismo scope (repos open-source de GitHub).
+
+**Analisis de viabilidad (RTX 4090, ~0.82s/batch):**
+
+- **200 MB corpus, 67 epochs**: ~176h (~7.3 dias). Viable. tok/param = 1796, comparable al ratio del 3.5M con 60MB (1080). Deberia desbloquear capacidad del 7M.
+- **536 MB corpus, 67 epochs**: ~471h (~20 dias). Inviable con 67 epochs. Con 20 epochs: ~140h (~5.8 dias), tok/param = 1436. Viable.
+- **200 MB corpus, 30 epochs**: ~78h (~3.3 dias). tok/param = 804. Compromiso razonable.
+
+**Nota sobre resume vs from-scratch**: Resumir desde el checkpoint epoch 67 (entrenado en 60MB) conserva patrones generales de Python ya aprendidos. Con un corpus mas grande, el test_bpb inicial subira temporalmente (distribucion ligeramente distinta) pero la convergencia sera mas rapida que entrenar desde cero. El floor de convergencia deberia ser inferior a 1.092 gracias a la mayor diversidad de datos.
+
+**Nota sobre kernels CUDA**: No se requieren cambios. Los kernels operan por batch (B, T, d) independientemente del tamanio del corpus. WHT (d=1024 <= 1024 max threads) y selective scan (T=256 <= 1024) permanecen dentro de limites hardware. Solo cambia el numero de batches por epoch.
+
+### 10.4 Proximos pasos experimentales sugeridos
+
+1. **Entrenar 7M con corpus 200MB** (resume desde epoch 67, lr=1e-4, 30 epochs, ~3.3 dias). Primer test de scaling con datos suficientes.
 2. **Evaluar generacion** en CPU con el checkpoint 3.5M epoch 50.
-3. **Medir efecto de corpus size**: mismo modelo sobre 56 MB, 100 MB, 200 MB, 1 GB.
-4. **Sweep de learning rate**: {1e-4, 2e-4, 3e-4, 5e-4} con cosine schedule.
-5. **Fine-tune 7M con LR reducido** (1e-4, cosine, 20 epochs adicionales) — en curso (run epochs 68-87).
+3. **Comparar BPB**: 7M-60MB vs 7M-200MB vs 3.5M-60MB para aislar efecto de datos vs parametros.
+4. **Si 200MB mejora**: considerar corpus 536MB con epochs reducidos (20 epochs, ~5.8 dias).
+5. **Sweep de learning rate**: {1e-4, 2e-4, 3e-4, 5e-4} con cosine schedule sobre 200MB.
