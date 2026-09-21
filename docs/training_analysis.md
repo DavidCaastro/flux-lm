@@ -456,21 +456,21 @@ Comparacion a iso-epochs en cosine schedule:
 | Throughput | ~55k tok/s | ~20k tok/s | ~20k tok/s |
 | VRAM peak | ~10 GB | ~3.8 GB | ~3.8 GB |
 
-**Observacion critica**: El modelo 3.5M con selective scan (epoch 50, BPB=0.963) supera al 7M v3 (epoch 67, BPB=1.092) por un margen significativo de 0.129 BPB.
+**Observacion critica**: El modelo 3.5M (epoch 50, BPB=0.963) supera al 7M v3 (epoch 67, BPB=1.092) por un margen significativo de 0.129 BPB. Ambos modelos fueron entrenados con selective scan activo (delta_fast_mod y delta_slow_mod presentes y entrenados desde epoch 1).
 
 ### 5.2 Factores que explican la diferencia
 
-Los dos modelos no son directamente comparables. Las diferencias clave:
+Verificacion posterior (2026-09-21) confirmo que el 7M v3 SI fue entrenado con selective scan desde el inicio. Los parametros delta_*_mod tienen normas entre 9 y 22 en el checkpoint epoch 67, con valores en rango [-3.7, +2.7] — lejos de los zeros iniciales. La diferencia de rendimiento no se explica por presencia/ausencia de selective scan.
 
-1. **Selective scan**: El modelo 3.5M en su mejor resultado (epoch 50) usaba decay content-dependent (selective scan), entrenado sobre 50 epochs totales con un schedule cosine que inicio en epoch 1.
+Hipotesis principal: **insuficiencia de datos para el modelo mas grande**.
 
-2. **Corpus**: Aunque ambos usan corpus Python similares (~56-60 MB), pueden diferir en composicion exacta de repositorios.
+1. **Ratio datos/parametros**: El corpus de ~60 MB contiene ~60M bytes. Con T=256 y 67 epochs, el modelo ve ~3.8 Gtok. Para 7M params esto da ~540 tokens/param. Para 3.5M params da ~1080 tokens/param. El modelo 7M tiene la mitad de tokens por parametro, lo que limita su capacidad de generalizacion.
 
-3. **Schedule**: El 3.5M tuvo un warmup mas rapido relativo (5% de 50 = 2.5 epochs) vs el 7M (5% de 67 = 3.35 epochs), y el cosine decay del 3.5M fue mas agresivo.
+2. **Gap train-test**: El 7M muestra train_bpb=1.244 vs test_bpb=1.092 (gap=0.152). El 3.5M muestra train_bpb=1.185 vs test_bpb=0.963 (gap=0.222 en baseline, reducido con selective scan). El gap menor del 7M no indica mejor generalizacion sino que ambos modelos estan limitados por los datos.
 
-4. **Version del modelo**: El 7M v3 puede tener diferencias en la arquitectura (ver parametro `Flux v3` en logs) respecto al modelo que genero el resultado 3.5M.
+3. **Convergencia temprana**: El 7M muestra estancamiento desde epoch ~35 (Delta_test < 0.001/epoch). Con mas datos, la curva podria continuar descendiendo.
 
-5. **VRAM anomalo**: El 7M reporta 3.8 GB peak con d=1024, mientras el 3.5M reporta 10 GB con d=512. Esto sugiere configuraciones diferentes de gradient checkpointing o batch effective size.
+4. **VRAM anomalo**: El 7M reporta 3.8 GB peak con d=1024, mientras el 3.5M reporta 10 GB con d=512. Esto sugiere configuraciones diferentes de gradient checkpointing o batch effective size.
 
 ### 5.3 Scaling law empirico
 
@@ -480,17 +480,14 @@ Con solo dos puntos de datos, la extrapolacion es limitada, pero para referencia
 Si: BPB(N) = A * N^(-alpha) + C
 
 Usando:
-  BPB(3.5M) = 0.963  [mejor resultado, selective scan]
-  BPB(7.0M) = 1.092  [run v3, cosine schedule]
+  BPB(3.5M) = 0.963  [selective scan, 50 epochs, ~2.8 Gtok]
+  BPB(7.0M) = 1.092  [selective scan, 67 epochs, ~3.8 Gtok]
 ```
 
-El modelo mas grande da peor resultado, lo que viola la relacion de scaling esperada. Esto confirma que la diferencia no es atribuible al tamanio del modelo sino a las diferencias experimentales listadas en 5.2.
-
-Para una comparacion justa, seria necesario entrenar ambos modelos con:
-- Mismo corpus exacto
-- Mismo schedule
-- Misma version de arquitectura (con/sin selective scan)
-- Mismo numero de tokens vistos
+El modelo mas grande da peor resultado, lo que viola la relacion de scaling esperada. Dado que ambos modelos usan selective scan, la causa mas probable es la insuficiencia de datos: 60 MB de corpus no permite al modelo 7M aprovechar su capacidad adicional. Para derivar scaling laws validas seria necesario:
+- Corpus significativamente mayor (>500 MB)
+- Mismo numero de tokens vistos por parametro
+- Mismo schedule y LR
 
 ---
 
@@ -678,20 +675,20 @@ Nota: La diferencia de VRAM entre 3.5M (10 GB) y 7M (3.8 GB) es contraintuitiva.
 
 3. **SGDR no es efectivo post-convergencia**: En modelos de 3.5M params, el warm restart con lr=3e-4 destruye estructura sin encontrar minimos mejores. La degradacion es monotona e irreversible.
 
-4. **El modelo 7M v3 no supera al 3.5M**: test_bpb 1.092 vs 0.963. Esto no implica que d=1024 sea peor, sino que las condiciones experimentales difieren (presencia/ausencia de selective scan, version del modelo, schedule).
+4. **El modelo 7M v3 no supera al 3.5M**: test_bpb 1.092 vs 0.963. Ambos usan selective scan. La causa probable es insuficiencia de datos: el corpus de 60 MB no provee suficientes tokens/parametro para que el 7M aproveche su capacidad extra (540 tok/param vs 1080 tok/param del 3.5M).
 
 ### 10.2 Limitaciones del analisis
 
 - Solo dos tamanios de modelo evaluados; no se pueden derivar scaling laws.
 - Un solo corpus (Python). Generalizacion a otros dominios no evaluada.
-- El modelo 7M v3 no fue entrenado con selective scan, lo que impide comparacion directa de capacidad.
+- El corpus de 60 MB es insuficiente para evaluar scaling: el 7M tiene ~540 tokens/param vs ~1080 del 3.5M.
 - No se midio la calidad generativa (perplexity en generacion, coherencia semantica).
 - Hiperparametros no fueron optimizados sistematicamente (no grid search, no Bayesian optimization).
 
 ### 10.3 Proximos pasos experimentales sugeridos
 
-1. **Entrenar 7M con selective scan** para comparacion justa vs 3.5M.
+1. **Ampliar corpus** (>500 MB) y re-entrenar 7M para evaluar si la capacidad extra se traduce en mejor BPB con datos suficientes.
 2. **Evaluar generacion** en CPU con el checkpoint 3.5M epoch 50.
 3. **Medir efecto de corpus size**: mismo modelo sobre 56 MB, 100 MB, 200 MB, 1 GB.
 4. **Sweep de learning rate**: {1e-4, 2e-4, 3e-4, 5e-4} con cosine schedule.
-5. **Cosine schedule con LR reducido post-convergencia** como alternativa a SGDR.
+5. **Fine-tune 7M con LR reducido** (1e-4, cosine, 20 epochs adicionales) — en curso (run epochs 68-87).
